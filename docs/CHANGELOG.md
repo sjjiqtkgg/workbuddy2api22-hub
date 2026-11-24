@@ -1,3 +1,9 @@
+## v2.2.3
+
+- **Responses 工具历史修复（Issue #26）**：并行工具批次中夹入孤立结果或开发者提示时，网关继续扫描并重排同批次结果；同一 `call_id` 的重复结果只保留第一条，避免上游 `400 / code 11148` 退役会话。
+- **TraeCode 指纹消毒（PR #30）**：仅将 system / developer / assistant 中的 `You are an interactive agent in TraeCode` 改写为 `You are an interactive agent`，规避上游非官方渠道拦截，用户与工具内容不变。
+- **出口感知统一模型名（PR #28 / #29）**：新增默认关闭的 `unified_models` 数据层；开启后 `/v1/models` 仅在目标模型属于当前出口时宣告统一名，并在 chat、Responses、Anthropic Messages 三类入口按出口解析真实模型 ID。Key 白名单同时接受客户端原名。
+
 ## v2.2.2
 
 - **CodeArts 余额汇总接口**：新增 `GET /v1/balance-summary`，支持 `Authorization: Bearer` 与 `?key=`，仅合计该 Key 允许使用的启用账号缓存积分（快照缺失返回 `null`，不主动打上游刷新）。

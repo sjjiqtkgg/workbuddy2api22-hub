@@ -208,6 +208,26 @@ check("a second batch is not swallowed as an intruder", not changed3)
 check("both batches survive",
       len([m for m in kept_batches if m.get("role") == "assistant"]) == 2)
 
+orphan_in_parallel = [{"role": "user", "content": "go"},
+                      assistant_with_calls("c0", "c1"),
+                      tool_result("c0"),
+                      tool_result("ghost"),
+                      {"role": "developer", "content": "<notice>"},
+                      tool_result("c1")]
+fixed_orphan, changed_orphan = P.repack_tool_result_blocks(
+    copy.deepcopy(orphan_in_parallel))
+check("an orphan between parallel results is reported as a change",
+      changed_orphan)
+check("both real results are moved ahead of the notice",
+      [m.get("tool_call_id") for m in fixed_orphan
+       if m.get("role") == "tool"] == ["c0", "c1", "ghost"],
+      [m.get("tool_call_id") for m in fixed_orphan
+       if m.get("role") == "tool"])
+check("the orphan no longer separates the real batch",
+      [m.get("role") for m in fixed_orphan[1:5]]
+      == ["assistant", "tool", "tool", "tool"],
+      [m.get("role") for m in fixed_orphan[1:5]])
+
 orphan_call = [{"role": "user", "content": "go"},
                assistant_with_calls("c0", "c1"),
                tool_result("c0")]
@@ -217,6 +237,19 @@ check("the unanswered call is dropped",
       [tc["id"] for tc in cleaned[1]["tool_calls"]] == ["c0"],
       cleaned[1].get("tool_calls"))
 check("the answered call survives", cleaned[2]["tool_call_id"] == "c0")
+
+duplicate_result = [{"role": "user", "content": "go"},
+                    assistant_with_calls("c0"),
+                    tool_result("c0"),
+                    tool_result("c0")]
+deduped, changed_dup = P.cleanup_orphan_tool_calls(
+    copy.deepcopy(duplicate_result))
+check("a duplicate result is reported as a change", changed_dup)
+check("only the first matching result survives",
+      len([m for m in deduped if m.get("role") == "tool"]) == 1,
+      [m for m in deduped if m.get("role") == "tool"])
+check("the surviving result keeps its call id",
+      deduped[-1].get("tool_call_id") == "c0", deduped[-1])
 
 orphan_result = [{"role": "user", "content": "go"},
                  {"role": "assistant", "content": "done"},
@@ -457,6 +490,59 @@ early_body = P.build_upstream_body(P.responses_to_chat(early_payload))
 early_roles = [m.get("role") for m in early_body["messages"]]
 check("build_upstream_body emits the call before its result",
       early_roles[-3:] == ["assistant", "tool", "user"], early_roles)
+
+# Issue #26 A: an orphan output and a developer notice sit inside a
+# parallel batch. The valid results must remain one contiguous block.
+issue26_a = {
+    "model": "deepseek-v4.1-flash",
+    "input": [
+        {"type": "message", "role": "user", "content": "go"},
+        {"type": "function_call", "call_id": "c1", "name": "lookup",
+         "arguments": "{}"},
+        {"type": "function_call", "call_id": "c2", "name": "lookup",
+         "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "OK"},
+        {"type": "function_call_output", "call_id": "c3", "output": "OK"},
+        {"type": "message", "role": "developer", "content": "notice"},
+        {"type": "function_call_output", "call_id": "c2", "output": "OK"},
+    ],
+}
+issue26_a_body = P.build_upstream_body(P.responses_to_chat(issue26_a))
+issue26_a_msgs = issue26_a_body["messages"]
+assistant_at = next(i for i, m in enumerate(issue26_a_msgs)
+                    if m.get("role") == "assistant" and m.get("tool_calls"))
+issue26_a_after = issue26_a_msgs[assistant_at + 1:]
+check("issue #26 A: the orphan result is removed",
+      [m.get("tool_call_id") for m in issue26_a_after
+       if m.get("role") == "tool"] == ["c1", "c2"],
+      [m.get("tool_call_id") for m in issue26_a_after
+       if m.get("role") == "tool"])
+check("issue #26 A: both results directly follow the batch",
+      [m.get("role") for m in issue26_a_after[:2]] == ["tool", "tool"],
+      [m.get("role") for m in issue26_a_after[:3]])
+check("issue #26 A: the developer notice is kept after the results",
+      any(m.get("content") == "notice" for m in issue26_a_after)
+      and issue26_a_after[2].get("content") == "notice",
+      issue26_a_after[:3])
+
+# Issue #26 B: the same output is replayed twice. One result per call is
+# all the upstream accepts.
+issue26_b = {
+    "model": "deepseek-v4.1-flash",
+    "input": [
+        {"type": "message", "role": "user", "content": "go"},
+        {"type": "function_call", "call_id": "c1", "name": "lookup",
+         "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "OK"},
+        {"type": "function_call_output", "call_id": "c1", "output": "OK"},
+    ],
+}
+issue26_b_body = P.build_upstream_body(P.responses_to_chat(issue26_b))
+check("issue #26 B: duplicate output is removed",
+      [m.get("tool_call_id") for m in issue26_b_body["messages"]
+       if m.get("role") == "tool"] == ["c1"],
+      [m.get("tool_call_id") for m in issue26_b_body["messages"]
+       if m.get("role") == "tool"])
 
 print()
 print("[4] integration: build_upstream_body applies the repairs")

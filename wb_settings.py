@@ -1494,6 +1494,108 @@ def set_model_aliases(accounts_dir, raw):
         data[MODEL_ALIASES_KEY] = cleaned
         save(accounts_dir, data)
     return cleaned
+# ---------------------------------------------------------------------------
+# 出口感知的统一模型（unified models）
+#
+# 与 operator alias 的区别：alias 是「一个别名 → 一个固定目标名」，不区分出口；
+# unified model 是「一个对外名 → 按出口解析成不同的真实 model id」：把 WB CN 的
+# deepseek-v4.1-flash 与 CodeArts 的 deepseek-v4.1-flash-1017 对外统一成一个
+# 名字，同时让各出口的关闭状态（disabledModels / key 限制）互不串扰。
+# 默认关：老安装的 settings.json 没有这些键，行为与从前逐字节一致。
+# ---------------------------------------------------------------------------
+UNIFIED_MODELS_KEY = "unified_models"
+UNIFIED_MODELS_ENABLED_KEY = "unified_models_enabled"
+MAX_UNIFIED_MODELS = 200
+MAX_UNIFIED_MODEL_LEN = 200
+#: 允许出现在 unified_models.<name> 下的出口键；未知出口会被清理掉。
+_UNIFIED_REALMS = frozenset(("cn", "intl", "codearts"))
+
+
+def _clean_unified_models(raw):
+    """归一化为 ``{lowercase 对外名: {realm: 真实 model id}}``。
+
+    接受对象形状；坏条目一律忽略，绝不让一份手改的设置文件把网关打挂。
+    每个名字下至少要有一个合法 (realm, target) 对才会保留。
+    """
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for name, realms in raw.items():
+        key = str(name or "").strip().lower()
+        if not key or len(key) > MAX_UNIFIED_MODEL_LEN or not isinstance(realms, dict):
+            continue
+        mapping = {}
+        for realm, target in realms.items():
+            r = str(realm or "").strip().lower()
+            t = str(target or "").strip()
+            if r in _UNIFIED_REALMS and t and len(t) <= MAX_UNIFIED_MODEL_LEN:
+                mapping[r] = t
+        if mapping:
+            out[key] = mapping
+    return out
+
+
+def unified_models(accounts_dir):
+    """读取原始统一模型表（不看开关；面板在关着时也要能编辑）。"""
+    raw = load(accounts_dir).get(UNIFIED_MODELS_KEY)
+    return _clean_unified_models(raw)
+
+
+def unified_models_enabled(accounts_dir):
+    """统一模型层是否启用；缺键按关。"""
+    return load(accounts_dir).get(UNIFIED_MODELS_ENABLED_KEY) is True
+
+
+def set_unified_models_enabled(accounts_dir, enabled):
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[UNIFIED_MODELS_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def effective_unified_models(accounts_dir):
+    """开关关着时返回空表；所有消费者都走这里。"""
+    if not unified_models_enabled(accounts_dir):
+        return {}
+    return unified_models(accounts_dir)
+
+
+def set_unified_models(accounts_dir, raw):
+    """落盘并回读归一化后的表；超上限或名字过长直接拒绝。"""
+    cleaned = _clean_unified_models(raw)
+    if len(cleaned) > MAX_UNIFIED_MODELS:
+        raise ValueError("unified model table holds at most %d entries"
+                         % MAX_UNIFIED_MODELS)
+    with _lock:
+        data = load(accounts_dir)
+        data[UNIFIED_MODELS_KEY] = cleaned
+        save(accounts_dir, data)
+    return cleaned
+
+
+def resolve_unified_model(name, realm, directory):
+    """按出口把对外统一名解析成真实 model id。
+
+    - 非统一名 / 表为空 / 开关关闭：原样返回（逐字节不变）。
+    - 该出口没有映射：原样返回，让上游按原 id 处理。
+    调用方应在 realm 已经确定之后调用本函数。
+    """
+    if not isinstance(name, str) or not name.strip():
+        return name
+    r = str(realm or "").strip().lower()
+    if not r:
+        return name
+    table = effective_unified_models(directory)
+    if not table:
+        return name
+    mapping = table.get(name.strip().lower())
+    if not mapping:
+        return name
+    return mapping.get(r, name)
+
+
 # 清单写进客户端配置后会被逐条展开；200 条已远超任何出口的模型数，上限只挡
 # 手编 settings.json 把客户端配置撑爆。
 MAX_AGENT_MODELS = 200
