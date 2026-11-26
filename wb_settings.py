@@ -1192,7 +1192,7 @@ def set_keep_backups(accounts_dir, value):
     return keep
 
 
-#: 后台排程时段（CST 24 小时制）。默认值与旧版硬编码完全一致，老安装行为不变。
+#: Default hourly schedule, in the scheduler's existing local time.
 DEFAULT_SCHEDULE_HOURS = {
     "checkin": [9, 21],
     "travel": [9, 21],
@@ -1263,12 +1263,9 @@ def set_schedule_hours(accounts_dir, value):
                 if hours is None:
                     raise ValueError("schedule.%s must contain hours 0-23" % key)
                 merged[key] = hours
-            else:
-                hours = _normalize_hours(current.get(key))
-                merged[key] = hours if hours is not None else list(DEFAULT_SCHEDULE_HOURS[key])
         data["schedule"] = merged
         save(accounts_dir, data)
-    return merged
+        return dict(merged, **schedule_hours(accounts_dir))
 
 
 #: 网页活跃（国际版每日活跃）的独立时段，HH:MM。空表示跟随 checkin 整点，
@@ -2881,6 +2878,80 @@ DAILY_CHAT_RANDOM_KEY = "daily_chat_random"
 DAILY_CHAT_STARTUP_CATCHUP_KEY = "daily_chat_startup_catchup"
 DAILY_CHAT_WEB_FALLBACK_ACTIVITY_KEY = "daily_chat_web_fallback_activity"
 DAILY_CHAT_PREFER_FLASH_KEY = "daily_chat_prefer_flash"
+
+#: 国内版签到 + 猫猫旅行的每日随机时段窗口（CST，左闭右开）。默认 08:00–09:59。
+CN_REWARDS_WINDOW = (8, 10)
+CN_REWARDS_RANDOM_KEY = "cn_rewards_random"
+
+
+def _draw_cn_rewards_time():
+    """在 CN_REWARDS_WINDOW 里抽一个分钟级时刻，返回 "HH:MM"。"""
+    start = CN_REWARDS_WINDOW[0] * 60
+    end = CN_REWARDS_WINDOW[1] * 60
+    if end <= start:
+        start, end = 8 * 60, 10 * 60
+    minute = random.randint(start, end - 1)
+    return "%02d:%02d" % (minute // 60, minute % 60)
+
+
+def cn_rewards_random_enabled(accounts_dir):
+    return load(accounts_dir).get("cn_rewards_random_enabled") is True
+
+
+def set_cn_rewards_random_enabled(accounts_dir, enabled):
+    if not isinstance(enabled, bool):
+        raise ValueError("cn_rewards_random_enabled must be true or false")
+    with _lock:
+        data = load(accounts_dir)
+        data["cn_rewards_random_enabled"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def cn_rewards_day_start(now):
+    """Beijing midnight as epoch seconds, independent of the statistics timezone."""
+    offset = wb_time.BEIJING_OFFSET
+    return ((int(now) + offset) // 86400) * 86400 - offset
+
+
+def cn_rewards_date(now):
+    return time.strftime("%Y-%m-%d", time.gmtime(now + wb_time.BEIJING_OFFSET))
+
+
+def cn_rewards_schedule(accounts_dir, now):
+    """Return the tasks with no hourly override and today's persisted slot."""
+    with _lock:
+        data = load(accounts_dir)
+        if data.get("cn_rewards_random_enabled") is not True:
+            return (), {}
+        schedule = data.get("schedule")
+        if not isinstance(schedule, dict):
+            schedule = {}
+        tasks = tuple(key for key in ("checkin", "travel")
+                      if _normalize_hours(schedule.get(key)) is None)
+        if not tasks:
+            return (), {}
+        today = cn_rewards_date(now)
+        state = data.get(CN_REWARDS_RANDOM_KEY)
+        if (not isinstance(state, dict) or state.get("date") != today
+                or not isinstance(state.get("time"), str)
+                or not _normalize_times([state["time"]])):
+            state = {"date": today, "time": _draw_cn_rewards_time()}
+            data[CN_REWARDS_RANDOM_KEY] = state
+            save(accounts_dir, data)
+        return tasks, state
+
+
+def complete_cn_rewards(accounts_dir, date, tasks, pending):
+    with _lock:
+        data = load(accounts_dir)
+        state = data.get(CN_REWARDS_RANDOM_KEY)
+        if not isinstance(state, dict) or state.get("date") != date:
+            return
+        done = set(state.get("done") or ()) | set(tasks)
+        data[CN_REWARDS_RANDOM_KEY] = dict(state, done=sorted(done),
+                                           pending=sorted(pending))
+        save(accounts_dir, data)
 
 
 def _clean_models(value):

@@ -36,6 +36,7 @@ class FakeState(object):
         self.chat_credit = 0.25
         self.credit_error = False
         self.chat_error = None    # (status, body_dict) 或 None
+        self.oauth_error = None   # (status, body_dict)：刷新 token 被判拒
         self.chat_error_remaining = -1  # -1 = 一直失败；N = 失败 N 次后恢复
         self.embedded_error = None  # {"error_code": ..., "error_msg": ...}
         self.require_benefit_header = False
@@ -210,6 +211,9 @@ class _Handler(BaseHTTPRequestHandler):
             state.last_body = {}
         if path == "/v1/oauth2/tokens":
             state.token_calls += 1
+            if state.oauth_error:
+                self._send_json(*state.oauth_error)
+                return
             form = urllib.parse.parse_qs(raw.decode("utf-8"))
             if form.get("grant_type", [""])[0] == "refresh_token":
                 if not self.headers.get("DPoP"):

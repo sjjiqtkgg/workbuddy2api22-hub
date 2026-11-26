@@ -51,6 +51,8 @@ S3_INTL_6004 = ('{"code":6004,"msg":"usage exceeds frequency limit, but don\'t '
                 'worry, your usage will reset at 2026-10-06 21:00:09 UTC+8, '
                 'alternatively, you can switch to the other models to continue '
                 'using it."}')
+S4_CN_14018 = ('{"code":14018,"msg":"额度已用尽，请访问链接购买加量包",'
+               '"displayMsg":{"zh":"额度已用尽，请访问链接购买加量包"}}')
 
 # A 429 also registers a window record (wb_window_probe) next to the gateway's
 # accounts dir. The stub pool below has no `dir`, so the write would fall back
@@ -133,7 +135,8 @@ class ModelCooldownTests(unittest.TestCase):
         self.assertEqual(failures, [])
 
     def drive_one_429(self, account, detail="usage exceeds frequency limit",
-                      stub_parser=True, model="glm-5.3", target_realm="cn"):
+                      stub_parser=True, model="glm-5.3", target_realm="cn",
+                      allow_http_error=False):
         """Drive open_upstream into an upstream 429 with a stubbed urlopen.
 
         Returns the reset instant the stubbed parser reported, so callers can
@@ -186,7 +189,9 @@ class ModelCooldownTests(unittest.TestCase):
             # existing parser's timezone handling.
             proxy.parse_rate_limit_reset = lambda _detail: reset
         try:
-            with self.assertRaises(proxy.RateLimited):
+            expected = ((proxy.RateLimited, urllib.error.HTTPError)
+                        if allow_http_error else proxy.RateLimited)
+            with self.assertRaises(expected):
                 proxy.open_upstream({"model": model, "messages": [
                     {"role": "user", "content": "hello"}]}, target_realm=target_realm)
         finally:
@@ -332,6 +337,39 @@ class ModelCooldownTests(unittest.TestCase):
         self.assertEqual([item["model"] for item in row["modelCooldowns"]], ["glm-5.3"])
         self.assertTrue(account.ready(model="another-model"))
 
+    def test_14018_429_parks_the_account_for_balance_recovery(self):
+        """14018 是积分耗尽，不能落入普通模型级 60 秒限流。"""
+        account = self._drive_unparsed(S4_CN_14018, "cn-14018",
+                                       allow_http_error=True)
+        row = account.public()
+        self.assertFalse(row["tokenExpired"], "积分耗尽不能被标成凭证失效")
+        self.assertTrue(row["inCooldown"], "积分耗尽应进入余额保护")
+        self.assertEqual(row["modelCooldowns"], [], "14018 不是单模型短限流")
+        self.assertIn("credits exhausted", row["lastError"])
+        self.assertGreater(account.balance_until, time.time() + 60)
+
+    def test_account_test_14018_uses_the_same_balance_protection(self):
+        """面板「测试」遇到 14018 时也必须使用余额保护分类。"""
+        account = self.account()
+        error = urllib.error.HTTPError(
+            "https://upstream.invalid", 429, "rate limit", {},
+            io.BytesIO(S4_CN_14018.encode("utf-8")))
+        old_urlopen = proxy.wb_accounts.urlopen
+        proxy.wb_accounts.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(error)
+        try:
+            result = proxy.probe_account(account, model="deepseek-v4.1-flash")
+        finally:
+            proxy.wb_accounts.urlopen = old_urlopen
+            error.close()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 429)
+        self.assertFalse(account.public()["tokenExpired"])
+        self.assertTrue(account.public()["inCooldown"])
+        self.assertEqual(account.public()["modelCooldowns"], [])
+        self.assertIn("14018", account.public()["lastErrorDetail"])
+        self.assertGreater(account.balance_until, time.time() + 60,
+                           "测试路径不能把积分耗尽只停 60 秒")
+
     def test_a_parsed_intl_429_still_parks_until_its_clock(self):
         """S3 - the control: a named reset instant still drives a model park."""
         expected = proxy.parse_rate_limit_reset(S3_INTL_6004)
@@ -346,14 +384,15 @@ class ModelCooldownTests(unittest.TestCase):
         # from the credential ladder.
         self.assertLessEqual(row["modelCooldowns"][0]["expiresAt"] - time.time(), 2)
 
-    def _drive_unparsed(self, detail, tag):
+    def _drive_unparsed(self, detail, tag, allow_http_error=False):
         """Feed one real 429 body through open_upstream, parser left in place."""
         directory = tempfile.mkdtemp(prefix="real-429-%s-" % tag)
         old_dir = proxy.ACCOUNTS_DIR
         proxy.ACCOUNTS_DIR = directory
         try:
             account = self.account()
-            self.drive_one_429(account, detail=detail, stub_parser=False)
+            self.drive_one_429(account, detail=detail, stub_parser=False,
+                               allow_http_error=allow_http_error)
             return account
         finally:
             proxy.ACCOUNTS_DIR = old_dir

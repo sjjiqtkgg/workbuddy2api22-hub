@@ -97,6 +97,14 @@ SOFT_COOLDOWN = 60.0
 #: 积分耗尽不是瞬时错误：账号需要等用户补积分或活动到账，60 秒后重试
 #: 只会把同一个 400 再打一遍。给它一个更长的可恢复冷却，仍会自然解冻。
 CREDIT_COOLDOWN = 600.0
+#: 认证类失败（401/403：上游判定这张临时凭证不可用）的退避冷却。
+#: 这类失败大多数不是账号报废——用一次性 refresh_token 换一张新凭证就能
+#: 恢复，所以既不能永久停用，也不该像积分耗尽那样一歇 10 分钟。按失败次数
+#: 指数退避（60s 起，30 分钟封顶），到期自动回到候选。
+AUTH_COOLDOWN = 60.0
+AUTH_COOLDOWN_MAX = 1800.0
+#: 连续认证失败的计数上限（只用来算退避，不影响能否被选中）。
+AUTH_ERR_CAP = 6
 #: 并发名额满时的最长等待（秒）。单账号并发上限默认 1，而客户端常常在同一
 #: 瞬间发出第二个请求（DSH 的自动标题请求就与首轮请求同时到达）。旧实现只
 #: 等约 100ms 就回「没有可用的 CodeArts 账号」，把一次几百毫秒的正常排队
@@ -434,6 +442,11 @@ class CodeArtsAccount(object):
         # 面板手动停用是独立于上游健康状态的操作员意图。token 刷新、
         # OAuth 重新登录和 note_error 都不能隐式把它清掉；只有 enable() 可以。
         self.manual_disabled = False
+        # 上游明确拒绝 refresh_token（invalid_grant / 已用过 / DPoP 不匹配）
+        # 才置位：这张凭证只能靠重新走一次浏览器 OAuth 才能救。它和
+        # disabled（操作员手动停用）是两个独立状态，刷新/重新授权成功即自动清除。
+        self.needs_relogin = False
+        self.auth_err_count = 0
         self.cool_until = 0.0
         self.err_count = 0
         self.last_error = ""
@@ -511,6 +524,9 @@ class CodeArtsAccount(object):
             "updated_at": int(time.time()),
         })
         self.auth = save_auth(self.pool.accounts_dir, self.auth)
+        # 换到新凭证即证明认证链路可用：认证类标记一律清除（与手动停用无关）。
+        self.needs_relogin = False
+        self.auth_err_count = 0
         if not self.manual_disabled:
             self.disabled = False
             self.disabled_reason = ""
@@ -544,6 +560,7 @@ class CodeArtsAccount(object):
             "package": info.get("package_name") or "",
             "checkin": self.checkin,
             "disabled": self.disabled,
+            "needs_relogin": bool(self.needs_relogin),
             "cooling": cooling,
             "until": (wb_time.strftime("%Y-%m-%dT%H:%M:%S", wb_time.localtime(self.cool_until))
                       if cooling else ""),
@@ -570,7 +587,8 @@ class CodeArtsAccount(object):
         刷新；把过期号直接过滤掉会让整池过期时一个号都选不到、也无法续期。
         """
         now = now or time.time()
-        return (not self.disabled) and now >= self.cool_until
+        return ((not self.disabled) and (not self.needs_relogin)
+                and now >= self.cool_until)
 
     def checked_in_today(self, now=None):
         """Whether this account already completed a successful check-in today.
@@ -639,6 +657,8 @@ class CodeArtsPool(object):
                 acct.manual_disabled = bool(acct.disabled) and any(
                     marker in reason for marker in
                     ("manual", "手动", "停用", "disabled by operator"))
+            acct.needs_relogin = bool(entry.get("needs_relogin"))
+            acct.auth_err_count = int(entry.get("auth_err_count") or 0)
             acct.note = str(entry.get("note") or "")[:200]
             acct.tasks_enabled = bool(entry.get("tasks_enabled", True))
             if isinstance(entry.get("checkin"), dict):
@@ -674,6 +694,8 @@ class CodeArtsPool(object):
                 "cool_until": acct.cool_until,
                 "disabled": acct.disabled,
                 "manual_disabled": bool(acct.manual_disabled),
+                "needs_relogin": bool(acct.needs_relogin),
+                "auth_err_count": acct.auth_err_count,
                 "reason": acct.disabled_reason,
                 "last_error": acct.last_error,
                 "checkin": acct.checkin,
@@ -716,19 +738,21 @@ class CodeArtsPool(object):
 
     def stats(self):
         now = time.time()
-        total = healthy = disabled = cooling = 0
+        total = healthy = disabled = cooling = relogin = 0
         with self._lock:
             accounts = list(self.accounts)
         for acct in accounts:
             total += 1
             if acct.disabled:
                 disabled += 1
+            elif acct.needs_relogin:
+                relogin += 1
             elif now < acct.cool_until:
                 cooling += 1
             else:
                 healthy += 1
         return {"total": total, "healthy": healthy, "disabled": disabled,
-                "cooling": cooling}
+                "cooling": cooling, "needs_relogin": relogin}
 
     # ---- 增删启停 ----
     def add(self, auth):
@@ -781,6 +805,8 @@ class CodeArtsPool(object):
         acct.disabled = False
         acct.disabled_reason = ""
         acct.manual_disabled = False
+        acct.needs_relogin = False
+        acct.auth_err_count = 0
         acct.last_error = ""
         acct.err_count = 0
         acct.cool_until = 0
@@ -905,11 +931,32 @@ class CodeArtsPool(object):
                 and acct.active_concurrent >= acct.max_concurrent]
 
     def note_success(self, acct):
-        if acct.err_count or acct.cool_until or acct.last_error:
+        if (acct.err_count or acct.cool_until or acct.last_error
+                or acct.auth_err_count):
             acct.err_count = 0
+            acct.auth_err_count = 0
             acct.cool_until = 0
             acct.last_error = ""
             self.save_state()
+
+    def note_auth_failure(self, acct, message):
+        """认证失败：退避冷却，但绝不把账号打成终态停用。
+
+        401/403 说的是「这张临时凭证此刻不可用」，不是「这个账号报废」。
+        needs_relogin 的号已被 healthy() 排除，这里只留痕；其余按失败次数
+        指数退避，冷却到期自动回到候选，不需要人工点「启用」。
+        """
+        text = str(message or "")[:200]
+        # 已经因 refresh_token 被拒而进入待重新登录的号，保留那条真正的原因，
+        # 不要让随后冒上来的 401 正文把它盖掉。
+        if not (acct.needs_relogin and acct.last_error):
+            acct.last_error = text
+        if not acct.needs_relogin:
+            acct.auth_err_count = min(acct.auth_err_count + 1, AUTH_ERR_CAP)
+            delay = min(AUTH_COOLDOWN_MAX,
+                        AUTH_COOLDOWN * (2 ** (acct.auth_err_count - 1)))
+            acct.cool_until = time.time() + delay
+        self.save_state()
 
     def note_error(self, acct, message, soft=False, terminal=False,
                    cooldown=None):
@@ -2091,21 +2138,35 @@ class CodeArtsStream(object):
         yield b"data: [DONE]\n\n"
 
 
-def _ensure_token(acct):
-    if not acct.expiring_soon() and not acct.expired():
+def _ensure_token(acct, force=False, failed_token=None):
+    """保证账号手上有一张当前可用的访问凭证。
+
+    force=True 用于「上游刚回了 401/403」：凭证的 expiration 看起来还没到，
+    但华为云已经判定它不可解密，只能无视剩余有效期、直接用 refresh_token
+    换新。刷新本身仍受 _refresh_lock 串行化，避免一次性 refresh_token 被
+    并发消费；传入 failed_token 时，若并发请求已经换到新凭证则直接复用。
+    """
+    if not force and not acct.expiring_soon() and not acct.expired():
         return
     # refresh_token 是一次性的：同一账号并发刷新会让后一个请求拿到已消费的
     # token。串行化，并在拿到锁后重新判断（前一个请求可能已经刷好了）。
     with acct._refresh_lock:
-        if not acct.expiring_soon() and not acct.expired():
+        if force:
+            if failed_token and acct.auth.get("cloud_dragon_token") != failed_token:
+                return
+        elif not acct.expiring_soon() and not acct.expired():
             return
         try:
             token = refresh_token_for(acct.auth, proxy=acct.proxy)
         except CodeArtsAuthError as exc:
-            acct.pool.note_error(acct, str(exc), terminal=True)
+            # refresh_token 本身被上游拒绝：这张凭证只能靠重新走一次浏览器
+            # OAuth 才能救。标记成 needs_relogin 而不是 disabled——后者表示
+            # 操作员「手动停用」的意图，两者不能混。
+            acct.needs_relogin = True
+            acct.pool.note_auth_failure(acct, str(exc))
             raise
         except CodeArtsError:
-            if acct.expired():
+            if force or acct.expired():
                 raise
             return
         acct.update_auth(token)
@@ -2343,7 +2404,23 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
                 ensure_models(acct, timeout=8.0)
             except CodeArtsError:
                 pass
-            stream, used = _client_chat(acct, body, session_key)
+            stale_token = acct.auth.get("cloud_dragon_token")
+            try:
+                stream, used = _client_chat(acct, body, session_key)
+            except CodeArtsAuthError as first_exc:
+                # 401/403 只说明「这张临时凭证此刻不可用」，不等于账号报废：
+                # 先无视有效期用一次性 refresh_token 换一张新凭证，成功就在同一
+                # 账号上就地重试一次。重试若命中非认证错误（如积分耗尽 / 429 /
+                # 400），直接交由外层对应分支处理，不再错记成认证失败。
+                if acct.needs_relogin:
+                    raise
+                try:
+                    _ensure_token(acct, force=True, failed_token=stale_token)
+                except CodeArtsAuthError:
+                    raise
+                except CodeArtsError:
+                    raise first_exc
+                stream, used = _client_chat(acct, body, session_key)
             pool.note_success(acct)
             pool.bind_session(session_key, acct.uid)
             return stream, acct, used
@@ -2351,7 +2428,8 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
             pool.release(acct)
             raise
         except CodeArtsAuthError as exc:
-            pool.note_error(acct, str(exc), terminal=True)
+            if not acct.needs_relogin:
+                pool.note_auth_failure(acct, str(exc))
             pool.release(acct)
             exclude.add(acct.uid)
             last_error = exc
@@ -2381,7 +2459,11 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
     now = time.time()
     for acct in list(pool.accounts):
         if acct.disabled:
-            reasons.append("%s 已停用：%s" % (acct.nickname, acct.disabled_reason or "手动停用"))
+            reasons.append("%s 已停用（手动）：%s"
+                           % (acct.nickname, acct.disabled_reason or "手动停用"))
+        elif acct.needs_relogin:
+            reasons.append("%s 需重新登录：%s"
+                           % (acct.nickname, acct.last_error or "refresh_token 已失效"))
         elif acct.cool_until > now:
             reasons.append("%s 冷却中：%s" % (acct.nickname, acct.last_error or "稍后重试"))
     if reasons:
@@ -2836,16 +2918,18 @@ def overview(config, force=False):
         except CodeArtsError:
             pass
     stats = pool.stats()
-    credit_remain = credit_total = credit_used = 0.0
+    credit_remain = credit_total = credit_used = credit_expiring = 0.0
     for acct in pool.accounts:
         total = ((acct.info or {}).get("credits") or {}).get("total")
         if isinstance(total, dict):
             credit_remain += float(total.get("remain") or 0)
             credit_total += float(total.get("amount") or 0)
             credit_used += float(total.get("used") or 0)
+            credit_expiring += float(total.get("expiring") or 0)
     stats["credits"] = round(credit_remain, 2)
     stats["credits_total"] = round(credit_total, 2)
     stats["credits_used"] = round(credit_used, 2)
+    stats["credits_expiring"] = round(credit_expiring, 2)
     accounts = pool.list()
     models = []
     seen = set()
@@ -2894,6 +2978,7 @@ def health(config, force=False):
         "configured": bool(config.get("enabled")),
         "accounts": stats["total"],
         "healthy": stats["healthy"],
+        "needs_relogin": stats.get("needs_relogin", 0),
         "base_url": SNAP_HOST,
     }
     _health_cache.update({"at": now, "value": value})

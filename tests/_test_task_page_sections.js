@@ -57,16 +57,15 @@ check('设置页不再重复显示优先 Flash 开关',
 check('国内版签到仍在每日任务区块',
   /<button class="primary" id="btnPageCheckin" onclick="triggerBuddyCheckin\(this\)">一键国内版签到<\/button>/.test(daily));
 check('猫猫旅行是每日任务单项入口',
-  /<button id="btnCatTravel" onclick="triggerCatTravel\(this\)">猫猫旅行<\/button>/.test(daily));
+  /<button\b[^>]*id="btnCatTravel"[^>]*onclick="triggerCatTravel\(this\)">猫猫旅行<\/button>/.test(daily));
 check('连登管家是每日任务单项入口',
-  /<button id="btnRunStreakBonus" onclick="triggerStreakBonus\(this\)">连登管家与抽奖<\/button>/.test(daily));
+  /<button\b[^>]*id="btnRunStreakBonus"[^>]*onclick="triggerStreakBonus\(this\)">连登管家与抽奖<\/button>/.test(daily));
 check('夜猫子是每日任务单项入口',
-  /<button id="btnRunNightTask" onclick="triggerNightTask\(this\)">夜猫子任务<\/button>/.test(daily));
-check('每日任务区块保留国际版与国内版状态卡',
-  daily.includes('id="intlTodayActiveState"') &&
-  daily.includes('id="cnTodayCheckinState"') &&
-  daily.includes('id="stkDays"') &&
-  daily.includes('id="catState"'));
+  /<button\b[^>]*id="btnRunNightTask"[^>]*onclick="triggerNightTask\(this\)">夜猫子任务<\/button>/.test(daily));
+check('每日任务保留国际版活跃状态和国内版七项状态',
+  daily.includes('id="intlTodayActiveState"') && daily.includes('class="cn-welfare-summary"') &&
+  ['cnTodayCheckinState', 'catState', 'cnTotalGranted', 'stkDays', 'makeupCards', 'lotteryChances', 'nrgBalance']
+    .every(id => daily.includes('<dd id="' + id + '">')));
 check('每日任务区块豁免 win-capped 限高并取消内部滚动与吸顶首行',
   /body\.win-capped \.main-page :is\([^)]*#sectionDailyTasks[^)]*\)\{max-height:none;overflow:visible\}/.test(html) &&
   /body\.win-capped \.main-page #sectionDailyTasks\{padding-top:18px\}/.test(html) &&

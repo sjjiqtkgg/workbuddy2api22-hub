@@ -60,6 +60,11 @@ check('连续软限流次数进 tooltip', cooled.includes('连续软限流 3 次
 check('只在连踩时才提次数', !row({inCooldown: true, cooldownFor: 60, softStreak: 1})
   .includes('连续软限流'), 'streak=1 不该出现该措辞');
 
+const balance = row({balanceProtected: true, balanceUntil: NOW + 3600,
+  inCooldown: true, cooldownFor: 3600, lastError: 'HTTP 429 (credits exhausted)'});
+check('积分耗尽要有独立徽章', balance.includes('额度耗尽'), balance);
+check('积分耗尽不能显示普通冷却', !balance.includes('冷却'), balance);
+
 const banned = row({enabled: false, tasksEnabled: false, accountBanned: true,
   inCooldown: true, cooldownFor: 7200});
 check('11140 账号封禁要有独立徽章', banned.includes('账号封禁'), banned);
@@ -108,6 +113,8 @@ api.setView('intl');
 api.setAccounts([
   {uid: 'intl-brk-0001', nickname: '熔断号', realm: 'intl', enabled: true, breakerFor: 1800},
   {uid: 'intl-deg-0002', nickname: '降权号', realm: 'intl', enabled: true, degradeFor: 600},
+  {uid: 'intl-credit-0005', nickname: '积分耗尽号', realm: 'intl', enabled: true,
+   balanceProtected: true, balanceUntil: NOW + 3600},
   {uid: 'intl-ban-0004', nickname: '封禁号', realm: 'intl', enabled: false,
    tasksEnabled: false, accountBanned: true,
    inCooldown: true, cooldownFor: 7200},
@@ -120,6 +127,9 @@ check('总览要包含降权', kinds.includes('降权'), kinds.join(','));
 check('总览要包含账号封禁', kinds.includes('账号封禁'), kinds.join(','));
 check('账号封禁不能同时画成上游限流',
   !rows.some(r => r.who.includes('封禁号') && r.kind === '上游限流'),
+  JSON.stringify(rows));
+check('积分耗尽要进入余额保护总览',
+  rows.some(r => r.who.includes('积分耗尽号') && r.kind === '余额保护'),
   JSON.stringify(rows));
 const brk = rows.find(r => r.kind === '熔断');
 check('熔断行要写清与账号本身无关', /账号与凭证本身没问题/.test(brk.reason), brk.reason);

@@ -23,7 +23,7 @@ class AuthFailureTextTests(unittest.TestCase):
             "HTTP 401: <html><head><title>401 Authorization Required</title></head></html>"))
 
     def test_plain_401_and_authorization_are(self):
-        for text in ("HTTP 401", "401 Unauthorized", "Authorization failed",
+        for text in ("401", "HTTP 401", "401 Unauthorized", "Authorization failed",
                      "invalid_token", "token expired"):
             with self.subTest(text=text):
                 self.assertTrue(wb_accounts._auth_failure_text(text))
@@ -53,6 +53,23 @@ class NoteErrorTests(unittest.TestCase):
         self.assertFalse(account.token_expired)
         account.cooldown_until = 0
         self.assertTrue(account.ready())
+
+    def test_429_request_id_containing_401_does_not_expire_token(self):
+        account = make_account()
+        account.note_error(
+            'HTTP 429: {"error":{"data":{"code":14018,'
+            '"msg":"credits exhausted",'
+            '"requestId":"01a21224014e1706497d6bfc32795759"}}}')
+        self.assertFalse(account.token_expired)
+        account.cooldown_until = 0
+        self.assertTrue(account.ready())
+
+    def test_non_401_explicit_auth_markers_still_count(self):
+        for text in ('HTTP 403: {"error":"invalid_token"}',
+                     'HTTP 400: {"msg":"token expired"}',
+                     'HTTP 403: Unauthorized'):
+            with self.subTest(text=text):
+                self.assertTrue(wb_accounts._auth_failure_text(text))
 
 
 class NoteSuccessTests(unittest.TestCase):

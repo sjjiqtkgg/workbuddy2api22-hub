@@ -1403,6 +1403,8 @@ class Account(object):
         is_token_expired = bool(getattr(self, "token_expired", False) or (exp and exp <= now) or not self.access_token)
         last_error, deadline, models, last_error_detail = \
             self._throttle_snapshot(now)
+        with self._throttle_lock:
+            balance_until = float(self.balance_until or 0.0)
         return {
             "uid": self.uid,
             "nickname": self.nickname or (self.uid[:8] if self.uid else "?"),
@@ -1433,6 +1435,8 @@ class Account(object):
             "lastErrorDetail": last_error_detail or None,
             "inCooldown": deadline > now,
             "cooldownFor": round(max(0.0, deadline - now)) or None,
+            "balanceProtected": balance_until > now,
+            "balanceUntil": int(balance_until) if balance_until > now else None,
             # 上游账号封禁（403 / 11140）：持久禁用，必须手动重新启用。
             "accountBanned": bool(self.account_banned),
             "bannedAt": self.banned_at or None,
@@ -3904,7 +3908,7 @@ class Account(object):
             self.restricted_until = 0.0
         return 0.0
 
-    def note_balance_cooled(self, message="insufficient credits"):
+    def note_balance_cooled(self, message="insufficient credits", detail=None):
         """402 / out of credits: park until the next local 04:00.
 
         A short cooldown would hand the empty account out again minutes
@@ -3916,6 +3920,7 @@ class Account(object):
         until = next_local_4am()
         with self._throttle_lock:
             self.last_error = str(message)[:200]
+            self.last_error_detail = str(detail)[:2000] if detail else ""
             self.balance_until = max(self.balance_until, until)
         return until
 
@@ -4211,7 +4216,19 @@ def _auth_failure_text(text):
         return True
     if "<html" in lower:
         return False
-    return ("401" in lower or "unauthorized" in lower or "authorization" in lower
+    # Error bodies often contain opaque request IDs or error codes (e.g. 14018)
+    # whose digits happen to include ``401``.  When an explicit HTTP status is
+    # present and is not 401, ignore bare ``401`` digits in the body while still
+    # recognizing explicit credential-failure phrases.
+    status = re.search(r"\bhttp(?:error)?\s+(\d{3})\b", lower)
+    if status:
+        if status.group(1) == "401":
+            return True
+        return ("unauthorized" in lower or "authorization" in lower
+                or "token expired" in lower)
+    explicit_401 = re.search(r"(?:^|[\s:(])401(?:$|[\s:),.])", lower)
+    return (explicit_401 is not None
+            or "unauthorized" in lower or "authorization" in lower
             or "token expired" in lower)
 
 

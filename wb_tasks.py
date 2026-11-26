@@ -792,8 +792,8 @@ def _travel_depart(account, lid):
         return None, str(exc)
 
 
-def do_cat_travel(account):
-    """检查并执行猫猫旅行 (领奖 / 派出)。"""
+def do_cat_travel(account, *, claim_only=False):
+    """检查旅行状态，领取奖励；常规巡检也会派出空闲的 Buddy。"""
     if getattr(account, "is_enterprise", lambda: False)():
         return {"ok": True, "action": "skip", "msg": "企业版账号无成长体系，跳过"}
     headers = account.headers("chat")
@@ -810,11 +810,16 @@ def do_cat_travel(account):
         try:
             with _accounts.urlopen(req_cl, timeout=10, proxy=account.proxy) as resp:
                 c_res = json.loads(resp.read().decode("utf-8"))
+                if c_res.get("code") not in (None, 0, "0"):
+                    return {"ok": False, "msg": c_res.get("msg") or "旅行奖励领取失败"}
                 credit = (c_res.get("data") or {}).get("reward_credit", 0)
                 account.fetch_credits()
                 return {"ok": True, "action": "claim", "credit": credit, "msg": f"旅行归来领奖成功！获得 {credit} 积分"}
         except Exception as e:
             return {"ok": False, "msg": f"领奖失败: {e}"}
+
+    if claim_only:
+        return {"ok": True, "action": state}
 
     if state == "idle":
         if st.get("daily_limit_reached"):
