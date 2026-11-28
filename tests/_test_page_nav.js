@@ -271,30 +271,34 @@ const secAccount = sectionEl('账号', { em: 'acctCount' });
 const secRecent = sectionEl('最近请求');
 const secGrowth = sectionEl('成长任务', { hidden: true });
 const secUntitled = sectionEl(null);                 // 没有 h2，不成项
+const secApiOnly = sectionEl(null);                  // 只有 data-api-nav，也成项
+secApiOnly.setAttribute('data-api-nav', '接口文档');
 const group = sectionEl('高级设置');
 const nestedA = sectionEl('嵌套甲');                  // 嵌套 section 属于父区块的内容
 const nestedB = sectionEl('嵌套乙');
 group.appendChild(nestedA);
 group.appendChild(nestedB);
-const gateway = pageEl('pageGateway', [secAccount, secRecent, secGrowth, secUntitled, group]);
+const gateway = pageEl('pageGateway', [secAccount, secRecent, secGrowth, secUntitled, secApiOnly, group]);
 
 assert.deepStrictEqual(
   api.pageNavSections(gateway).map(sec => api.pageNavLabel(sec, 0)),
-  ['账号', '最近请求', '高级设置'],
-  '只收最外层、有 h2、且未隐藏的区块；标题要剔除 <em>');
+  ['账号', '最近请求', '接口文档', '高级设置'],
+  '只收最外层、有 h2 或 data-api-nav、且未隐藏的区块；标题要剔除 <em>');
+assert.strictEqual(api.pageNavLabel(secApiOnly, 0), '接口文档',
+  'data-api-nav 应优先作为导航标签');
 
 // 隐藏的嵌套区块本来也不成项
 nestedA.style.display = 'none';
 assert.deepStrictEqual(
   api.pageNavSections(gateway).map(sec => api.pageNavLabel(sec, 0)),
-  ['账号', '最近请求', '高级设置'],
+  ['账号', '最近请求', '接口文档', '高级设置'],
   '隐藏的嵌套区块本来也不成项');
 nestedA.style.display = '';
 // 整块显隐确实会改变清单
 secGrowth.style.display = 'block';
 assert.deepStrictEqual(
   api.pageNavSections(gateway).map(sec => api.pageNavLabel(sec, 0)),
-  ['账号', '最近请求', '成长任务', '高级设置'],
+  ['账号', '最近请求', '成长任务', '接口文档', '高级设置'],
   '区块显出来后要进导航');
 secGrowth.style.display = 'none';
 
@@ -315,7 +319,7 @@ api.pageNavSections(gateway).forEach((sec, i) => { sec.rectTop = 120 + i * 300; 
 api.initPageNav(gateway);
 assert.ok(gateway.classList.contains('page-nav-on'), '区块够多应启用页面级两栏');
 assert.strictEqual(gateway.firstChild, gateway.querySelector('.page-sidebar'), '侧栏要插在页面最前面');
-assert.deepStrictEqual(labels(gateway), ['账号', '最近请求', '高级设置'], '导航项就是区块标题');
+assert.deepStrictEqual(labels(gateway), ['账号', '最近请求', '接口文档', '高级设置'], '导航项就是区块标题');
 for(const sec of api.pageNavSections(gateway)){
   assert.ok(sec.id, '每个参与导航的区块都要有锚点 id');
 }
@@ -346,7 +350,7 @@ assert.strictEqual(navItems(gateway)[0], itemBefore,
 /* ---- 5. 区块清单变了就重建 ---- */
 secGrowth.style.display = 'block';                    // 成长任务显出来
 api.initPageNav(gateway);
-assert.deepStrictEqual(labels(gateway), ['账号', '最近请求', '成长任务', '高级设置'],
+assert.deepStrictEqual(labels(gateway), ['账号', '最近请求', '成长任务', '接口文档', '高级设置'],
   '区块显隐变化后导航要跟上');
 assert.strictEqual(gateway.querySelector('.page-sidebar'), sidebarBefore,
   '重建复用同一个侧栏容器，只换里面的项');
@@ -422,7 +426,7 @@ root.appendChild(btnGateway);
 attach(pageEl('pageSettings', [sectionEl('甲'), sectionEl('乙'), sectionEl('丙')]));
 api.switchMainTab('gateway');
 assert.ok(gateway.classList.contains('active'), '切到 gateway 应激活该页');
-assert.deepStrictEqual(labels(gateway), ['账号', '最近请求', '成长任务', '高级设置'],
+assert.deepStrictEqual(labels(gateway), ['账号', '最近请求', '成长任务', '接口文档', '高级设置'],
   '切回 gateway 用的是它自己的区块清单');
 
 // 每个页面各自一份侧栏，互不串台
@@ -430,7 +434,7 @@ const pageSettings = document.getElementById('pageSettings');
 api.initPageNav(pageSettings);
 assert.deepStrictEqual(pageSettings.querySelectorAll('.page-nav-item').map(b => b.textContent),
   ['甲', '乙', '丙'], 'settings 的导航来自 settings 的区块');
-assert.deepStrictEqual(labels(gateway), ['账号', '最近请求', '成长任务', '高级设置'],
+assert.deepStrictEqual(labels(gateway), ['账号', '最近请求', '成长任务', '接口文档', '高级设置'],
   '给别的页面建栏不该动到 gateway 的侧栏');
 assert.notStrictEqual(pageSettings.querySelector('.page-sidebar'), gateway.querySelector('.page-sidebar'),
   '每个页面有各自的侧栏容器');
@@ -449,7 +453,7 @@ assert.strictEqual(localStorage.getItem(api.PAGE_NAV_COLLAPSE_KEY), '1', '收起
 assert.strictEqual(toggleOf(gateway).textContent, '»', '收起后按钮指向「展开」');
 assert.strictEqual(toggleOf(gateway).getAttribute('aria-expanded'), 'false', '收起时 aria-expanded 为 false');
 // 收起只压列宽，导航项本身还在 DOM 里（由 CSS 隐藏），重新展开不该丢东西
-assert.deepStrictEqual(labels(gateway), ['账号', '最近请求', '成长任务', '高级设置'],
+assert.deepStrictEqual(labels(gateway), ['账号', '最近请求', '成长任务', '接口文档', '高级设置'],
   '收起不该重建或丢掉导航项');
 
 toggleOf(gateway).listeners.click[0]();

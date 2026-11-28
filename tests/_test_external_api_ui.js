@@ -42,6 +42,19 @@ for(const [tab, pane] of [['apiModelTab', 'apiPaneModels'], ['apiKeyTab', 'apiPa
         && html.includes('id="' + pane + '" class="api-pane" role="tabpanel" aria-labelledby="' + tab + '"'),
     '接入入口与内容面板应一一关联：' + tab);
 }
+for(const label of ['模型调用 Key', '外部账号接口 Key', '调用记录', '接口文档']){
+  check(html.includes('data-api-nav="' + label + '"'),
+    '接入区块应带本页导航标签：' + label);
+}
+for(const id of ['apiPaneKeys', 'apiPaneRecords', 'apiPaneDocs']){
+  check(!new RegExp('id="' + id + '"[^>]*\\bhidden\\b').test(html),
+    id + ' 应常驻显示，不再由顶部页签互斥隐藏');
+}
+check(/#pageApi \.api-page-tabs\{display:none!important\}/.test(html),
+  '接入页顶部页签应隐藏，改由左侧本页导航定位');
+check(/html\[data-ui="next"\] :is\(#pageOverview,#pageGateway,#pageAnalytics,[\s\S]*?\)\.page-nav-on > \.page-sidebar\{[\s\S]*?display:none !important;/.test(html)
+      && !/html\[data-ui="next"\] :is\([^)]*#pageApi[^)]*\)\.page-nav-on > \.page-sidebar\{[\s\S]*?display:none !important;/.test(html),
+  'Next UI 不应隐藏接入页的本页导航');
 
 const pageStart = html.indexOf('<div id="pageApi"');
 const pageEnd = html.indexOf('<div id="pageAgents"', pageStart);
@@ -90,6 +103,8 @@ check(/curl[\s\S]{0,300}Authorization: Bearer/.test(script),
   '文档应动态提供带 Bearer 鉴权的完整 cURL 示例');
 check(/function\s+loadExternalApiPage\(\)/.test(script),
   '切换接入页时应有独立加载函数');
+check(/function\s+selectExternalApiPanel\(panel, button\)[\s\S]*?if\(pane\) pane\.hidden = false;/.test(script),
+  '接入页内容不应再由顶部页签互斥隐藏');
 check(/EXTERNAL_API_RECORD_PAGE_SIZE\s*=\s*20/.test(script),
   '调用记录默认每页 20 条');
 check(/external\/call-records\?page=/.test(script) && /page_size=/.test(script),

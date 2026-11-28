@@ -69,6 +69,31 @@ const media = html.slice(mediaStart, mediaEnd);
   assert.ok(media.includes('id="' + id + '"'), '控件 ' + id + ' 应在 pageMedia 里');
 });
 
+// 字符串区间只能证明“写在两个页面标题之间”，不能证明浏览器解析后的 DOM
+// 归属。pageMedia 提前闭合过一次，三块内容就会挂到 pageAnalytics 里。
+const pageMarkers = [
+  '<div id="pageMedia"', '<div id="pageAnalytics"', '<div id="pageAgents"'
+].map(marker => html.indexOf(marker));
+assert.ok(pageMarkers.every(index => index > 0), '页面容器标记应完整');
+const mediaMarkup = html.slice(pageMarkers[0], pageMarkers[1]);
+let divDepth = 0;
+let firstMediaClose = -1;
+for (const match of mediaMarkup.matchAll(/<\/?div\b[^>]*>/g)) {
+  if (match[0].startsWith('</')) divDepth -= 1;
+  else divDepth += 1;
+  if (divDepth === 0) {
+    firstMediaClose = match.index;
+    break;
+  }
+}
+assert.ok(firstMediaClose > 0, 'pageMedia 应在 pageAnalytics 之前闭合');
+[
+  'id="setWatermarkState"', 'id="setEmbeddingsState"', 'id="mcpState"'
+].forEach(marker => {
+  assert.ok(mediaMarkup.indexOf(marker) < firstMediaClose,
+    marker + ' 必须位于 pageMedia 容器闭合之前');
+});
+
 assert.ok(/onclick="saveWatermarkConfig\(this\)"/.test(media), '去水印应有保存按钮');
 assert.ok(/onclick="saveEmbeddingsConfig\(this\)"/.test(media), '嵌入应有保存按钮');
 assert.ok(/onclick="copyMcpConfig\(\)"/.test(media), 'MCP 应有复制配置按钮');

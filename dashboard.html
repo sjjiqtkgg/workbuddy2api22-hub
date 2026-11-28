@@ -922,6 +922,8 @@ a:hover{text-decoration:underline}
 .api-page-tab:hover{color:var(--fg);background:var(--panel)}
 .api-page-tab.active{background:var(--panel);border-color:var(--line);color:var(--fg);font-weight:600;box-shadow:var(--shadow-sm)}
 .api-pane[hidden]{display:none!important}
+/* 接入页四块内容改由左侧本页导航定位，顶部页签只保留 DOM 兼容。 */
+#pageApi .api-page-tabs{display:none!important}
 .api-section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
 .api-section-head h3{margin:0;font-size:14px;color:var(--fg);font-weight:650}
 .api-section-head p{margin:4px 0 0;color:var(--dim);font-size:11px;line-height:1.5}
@@ -6310,7 +6312,7 @@ html[data-ui="next"] #pageGateway .next-gateway-head{
 html[data-ui="next"] #pageGateway .next-gateway-head > div:first-child{
   display:none !important;
 }
-html[data-ui="next"] :is(#pageOverview,#pageGateway,#pageApi,#pageAnalytics,
+html[data-ui="next"] :is(#pageOverview,#pageGateway,#pageAnalytics,
   #pageTasks,#pageAgents,#pageMedia,#pageLogs).page-nav-on > .page-sidebar{
   display:none !important;
 }
@@ -9950,8 +9952,6 @@ html:not([data-ui="next"]) .settings-cat-bar{
         语音合成 <code>/v1/audio/speech</code> 与语音转写 <code>/v1/audio/transcriptions</code> 默认关闭；开启后使用文本号池账号，并计入当前账号的积分消耗。
       </div>
     </section>
-  </div>
-
 
     <!-- 去水印：配置 + 就地试用。上游生图会在画面底部留一条纯白带（水印位），
          裁掉它比重新生成一张便宜得多——这里是纯本地像素运算，一个字节都不发上游。 -->
@@ -10063,6 +10063,7 @@ html:not([data-ui="next"]) .settings-cat-bar{
         所以 MCP 这边花掉的积分和 REST 是同一本账；只有 <code>strip_watermark</code> 是本地后处理，不扣积分。
       </div>
     </section>
+  </div>
   <div id="pageAnalytics" class="main-page">
     <div class="wrap">
 <!-- ====================== 页头 + 范围 ====================== -->
@@ -11685,7 +11686,7 @@ html:not([data-ui="next"]) .settings-cat-bar{
     </div>
 
     <div id="apiPaneModels" class="api-pane" role="tabpanel" aria-labelledby="apiModelTab">
-      <section>
+      <section data-api-nav="模型调用 Key">
         <div class="api-section-head">
           <div>
             <h3>模型调用 Key <em id="setKeyState"></em></h3>
@@ -11721,8 +11722,8 @@ html:not([data-ui="next"]) .settings-cat-bar{
       </section>
     </div>
 
-    <div id="apiPaneKeys" class="api-pane" role="tabpanel" aria-labelledby="apiKeyTab" hidden>
-      <section>
+    <div id="apiPaneKeys" class="api-pane" role="tabpanel" aria-labelledby="apiKeyTab">
+      <section data-api-nav="外部账号接口 Key">
         <div class="api-section-head">
           <div>
             <h3>外部账号接口 Key</h3>
@@ -11747,8 +11748,8 @@ html:not([data-ui="next"]) .settings-cat-bar{
 
     </div>
 
-    <div id="apiPaneRecords" class="api-pane" role="tabpanel" aria-labelledby="apiRecordsTab" hidden>
-      <section>
+    <div id="apiPaneRecords" class="api-pane" role="tabpanel" aria-labelledby="apiRecordsTab">
+      <section data-api-nav="调用记录">
         <div class="api-section-head">
           <div>
             <h3>调用记录</h3>
@@ -11760,30 +11761,32 @@ html:not([data-ui="next"]) .settings-cat-bar{
       </section>
     </div>
 
-    <div id="apiPaneDocs" class="api-pane" role="tabpanel" aria-labelledby="apiDocsTab" hidden>
-      <label class="api-doc-picker">
-        <span>接口列表</span>
-        <select id="apiDocPicker" onchange="selectExternalApiDoc(this.value)">
-          <option value="authorize">创建账号授权请求</option>
-          <option value="authorize-status">查询账号授权状态</option>
-          <option value="accounts">读取账号列表</option>
-        </select>
-      </label>
-      <div class="api-doc-layout">
-        <aside class="api-doc-list" id="apiDocList">
-          <div class="api-doc-list-title">接口列表</div>
-          <button type="button" class="api-doc-item active" data-doc="authorize" onclick="selectExternalApiDoc('authorize', this)">
-            <span class="api-doc-method">POST</span><span class="api-doc-path">/v1/accounts/authorize</span>
-          </button>
-          <button type="button" class="api-doc-item" data-doc="authorize-status" onclick="selectExternalApiDoc('authorize-status', this)">
-            <span class="api-doc-method">GET</span><span class="api-doc-path">/v1/accounts/authorize/{request_id}</span>
-          </button>
-          <button type="button" class="api-doc-item" data-doc="accounts" onclick="selectExternalApiDoc('accounts', this)">
-            <span class="api-doc-method">GET</span><span class="api-doc-path">/v1/accounts?realm=intl</span>
-          </button>
-        </aside>
-        <section class="api-doc-detail" id="apiDocDetail"></section>
-      </div>
+    <div id="apiPaneDocs" class="api-pane" role="tabpanel" aria-labelledby="apiDocsTab">
+      <section data-api-nav="接口文档">
+        <label class="api-doc-picker">
+          <span>接口列表</span>
+          <select id="apiDocPicker" onchange="selectExternalApiDoc(this.value)">
+            <option value="authorize">创建账号授权请求</option>
+            <option value="authorize-status">查询账号授权状态</option>
+            <option value="accounts">读取账号列表</option>
+          </select>
+        </label>
+        <div class="api-doc-layout">
+          <aside class="api-doc-list" id="apiDocList">
+            <div class="api-doc-list-title">接口列表</div>
+            <button type="button" class="api-doc-item active" data-doc="authorize" onclick="selectExternalApiDoc('authorize', this)">
+              <span class="api-doc-method">POST</span><span class="api-doc-path">/v1/accounts/authorize</span>
+            </button>
+            <button type="button" class="api-doc-item" data-doc="authorize-status" onclick="selectExternalApiDoc('authorize-status', this)">
+              <span class="api-doc-method">GET</span><span class="api-doc-path">/v1/accounts/authorize/{request_id}</span>
+            </button>
+            <button type="button" class="api-doc-item" data-doc="accounts" onclick="selectExternalApiDoc('accounts', this)">
+              <span class="api-doc-method">GET</span><span class="api-doc-path">/v1/accounts?realm=intl</span>
+            </button>
+          </aside>
+          <section class="api-doc-detail" id="apiDocDetail"></section>
+        </div>
+      </section>
     </div>
   </div>
 
@@ -19756,7 +19759,7 @@ function pageNavSections(page){
   if(!page) return [];
   return Array.from(page.querySelectorAll('section')).filter(function(sec){
     if(getComputedStyle(sec).display === 'none') return false;
-    if(!sec.querySelector('h2')) return false;
+    if(!sec.querySelector('h2') && !sec.hasAttribute('data-api-nav')) return false;
     for(let p = sec.parentElement; p && p !== page; p = p.parentElement){
       if(p.tagName === 'SECTION') return false;
     }
@@ -19765,6 +19768,11 @@ function pageNavSections(page){
 }
 
 function pageNavLabel(section, index){
+  const apiNav = section.getAttribute('data-api-nav');
+  if(apiNav){
+    const label = apiNav.replace(/\s+/g, ' ').trim();
+    if(label) return label;
+  }
   const h2 = section.querySelector('h2');
   if(h2){
     const clone = h2.cloneNode(true);
@@ -25326,7 +25334,8 @@ function selectExternalApiPanel(panel, button){
     const active = key === panel;
     const pane = document.getElementById(paneId);
     const tab = document.getElementById(tabId);
-    if(pane) pane.hidden = !active;
+    // 四块内容常驻显示，由左侧本页导航滚动定位；顶部页签仅保留兼容状态。
+    if(pane) pane.hidden = false;
     if(!tab) return;
     tab.classList.toggle('active', active);
     tab.setAttribute('aria-selected', active ? 'true' : 'false');
