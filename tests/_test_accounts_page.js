@@ -27,7 +27,7 @@ const script = dashboardScript();
 
 assert.ok(/id="btnNavAccounts"[^>]*onclick="switchMainTab\('accounts'\)"/.test(html),
   '顶部导航应有「账号」菜单，并指向 switchMainTab(\'accounts\')');
-assert.ok(/<div id="pageAccounts" class="main-page">/.test(html),
+assert.ok(/<div id="pageAccounts" class="main-page(?:\s[^"]*)?">/.test(html),
   '缺少账号页容器 #pageAccounts.main-page');
 
 const pageGatewayAt = html.indexOf('<div id="pageGateway"');

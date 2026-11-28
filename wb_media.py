@@ -402,6 +402,126 @@ def build_edit_body(model_id, prompt, size, images):
     return body
 
 
+_MIME_BY_EXTENSION = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+}
+
+_DISP_NAME_RE = re.compile(r'(?:^|;)\s*name=(?:"([^"]*)"|([^;\s]*))', re.I)
+_DISP_FILE_RE = re.compile(r'(?:^|;)\s*filename=(?:"([^"]*)"|([^;\s]*))', re.I)
+
+
+def sniff_image_mime(data, fallback="image/png"):
+    """按魔数嗅探图片类型，照抄官方 CLI 的 detectMimeTypeFromBase64。"""
+    if len(data) >= 4 and data[0] == 0x89 and data[1] == 0x50 \
+            and data[2] == 0x4E and data[3] == 0x47:
+        return "image/png"
+    if len(data) >= 3 and data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF:
+        return "image/jpeg"
+    if len(data) >= 4 and data[:4] == b"GIF8":
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 2 and data[:2] == b"BM":
+        return "image/bmp"
+    return fallback
+
+
+def _mime_for_filename(filename):
+    text = str(filename or "").strip().lower()
+    dot = text.rfind(".")
+    if dot < 0:
+        return None
+    return _MIME_BY_EXTENSION.get(text[dot:])
+
+
+def _multipart_boundary(content_type):
+    for param in str(content_type or "").split(";")[1:]:
+        key, sep, val = param.strip().partition("=")
+        if sep and key.strip().lower() == "boundary":
+            boundary = val.strip()
+            if len(boundary) >= 2 and boundary[0] == '"' and boundary[-1] == '"':
+                boundary = boundary[1:-1]
+            if not boundary:
+                raise MediaError("INVALID_ARGS", "multipart/form-data 的 boundary 为空")
+            return boundary
+    raise MediaError("INVALID_ARGS", "multipart/form-data 缺少 boundary")
+
+
+def _iter_multipart_parts(body, content_type):
+    """解析 RFC 7578 multipart/form-data，返回 (field, filename_or_None, mime, bytes)。"""
+    boundary = _multipart_boundary(content_type)
+    separator = b"--" + boundary.encode("latin-1", "replace")
+    raw = bytes(body or b"")
+    for part in raw.split(separator)[1:]:
+        if part.startswith(b"--"):
+            break
+        if part.startswith(b"\r\n"):
+            part = part[2:]
+        elif part.startswith(b"\n"):
+            part = part[1:]
+        if part.endswith(b"\r\n"):
+            part = part[:-2]
+        elif part.endswith(b"\n"):
+            part = part[:-1]
+        if b"\r\n\r\n" in part:
+            head, data = part.split(b"\r\n\r\n", 1)
+            header_lines = head.split(b"\r\n")
+        elif b"\n\n" in part:
+            head, data = part.split(b"\n\n", 1)
+            header_lines = head.split(b"\n")
+        else:
+            continue
+        headers = {}
+        for line in header_lines:
+            if b":" not in line:
+                continue
+            name, value = line.split(b":", 1)
+            headers[name.strip().lower()] = value.strip()
+        disposition = headers.get(b"content-disposition", b"").decode("utf-8", "replace")
+        m_name = _DISP_NAME_RE.search(disposition)
+        field = (m_name.group(1) if m_name.group(1) is not None else m_name.group(2)) if m_name else ""
+        if not field:
+            continue
+        m_file = _DISP_FILE_RE.search(disposition)
+        filename = (m_file.group(1) if m_file.group(1) is not None else m_file.group(2)) if m_file else None
+        part_type = headers.get(b"content-type", b"").decode("latin-1", "replace").split(";")[0].strip().lower()
+        if part_type == "image/jpg":
+            part_type = "image/jpeg"
+        yield field, filename, part_type, data
+
+
+def parse_edit_multipart(body, content_type):
+    """把 OpenAI `/v1/images/edits` 的 multipart/form-data 转成标准 payload 字典。
+
+    - `image` / `image[]` 文件部分校验 8 MB 上限并编码为 `data:image/*;base64,...`；
+      纯文本 URL / data URL 部分保留原文交给下游 SSRF / 格式校验。
+    - 文本表单字段（`prompt` / `model` / `size` / `n` / `response_format` 等）按 UTF-8 解码。
+    """
+    payload = {}
+    images = []
+    for field, filename, part_type, data in _iter_multipart_parts(body, content_type):
+        if field in ("image", "image[]"):
+            magic = sniff_image_mime(data, fallback=None)
+            if filename is None and magic is None and part_type in ("", "text/plain"):
+                text = data.decode("utf-8", "replace").strip()
+                if not text:
+                    raise MediaError("INVALID_ARGS", "multipart 中的输入图不能为空")
+                images.append(text)
+            else:
+                assert_input_image_bytes(len(data), "输入图（multipart %s）" % field)
+                mime = magic or (part_type if part_type.startswith("image/") else None) or _mime_for_filename(filename) or "image/png"
+                images.append("data:%s;base64,%s" % (mime, base64.b64encode(data).decode("ascii")))
+        elif filename is not None or (part_type and not part_type.startswith("text/")):
+            # 忽略额外的二进制附件（如 OpenAI mask），避免把原始字节解码成乱码字段。
+            continue
+        else:
+            payload[field] = data.decode("utf-8", "replace")
+    if images:
+        payload["image"] = images
+    return payload
+
+
 # ---------------------------------------------------------------- 视频参数
 
 def _coerce_seconds(value):

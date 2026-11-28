@@ -25,6 +25,7 @@ import hashlib
 import heapq
 import http.client
 import io
+import shutil
 import ipaddress
 from collections import OrderedDict, deque
 import re
@@ -74,6 +75,7 @@ import wb_activity
 import wb_audio
 import wb_atrest
 import wb_catalog
+import wb_client_aliases
 import wb_codearts
 import wb_egress
 import wb_ipintel
@@ -84,8 +86,12 @@ import wb_media_tasks
 import wb_pool_media
 import wb_pool_scope
 import wb_pool_text
+import wb_embeddings
+import wb_mcp
+import wb_watermark
 import wb_pricing
 import wb_usage_io
+import wb_keyquota
 from wb_usage_board import UsageBoard
 import wb_settings
 import wb_webprompts
@@ -100,6 +106,7 @@ import wb_updates
 import wb_update_request
 import wb_time
 import wb_external_api
+import wb_data_backup
 IS_WINDOWS = os.name == "nt"
 
 
@@ -337,6 +344,57 @@ AUDIO_POST_PATHS = (
     "/v1/audio/speech", "/audio/speech",
     "/v1/audio/transcriptions", "/audio/transcriptions",
 )
+
+#: 去水印路由。本地像素运算，不碰上游、不扣积分，所以**不受媒体总闸管**——它
+#: 有自己的开关（settings.watermark.enabled），因为两者的风险完全不同：生图是
+#: 花钱，去水印只是多一个能读 URL 的入口。
+WATERMARK_POST_PATHS = ("/v1/images/strip-watermark",)
+
+#: 嵌入路由。与 chat 同一个 API Key 门，同样不占 chat 并发槽（它是一次性的
+#: 短请求，排队只会让批量任务互相堵）。
+EMBEDDINGS_POST_PATHS = ("/v1/embeddings", "/embeddings")
+
+#: MCP 端点。单一路径，方法全在 JSON-RPC 的 method 字段里。
+MCP_PATH = "/mcp"
+
+#: MCP 的 initialize 会把这整段塞给客户端，所以它要能独立看懂：讲清能用什么、
+#: 哪一步要花钱、产物多久失效。写得像给同事留的便条，而不是 API 文档摘要。
+MCP_INSTRUCTIONS = """\
+本网关把 WorkBuddy 的生图 / 改图 / 生视频能力包装成 MCP 工具，鉴权与 REST 相同
+（Authorization: Bearer <网关 API Key>）。
+
+用法要点：
+1. 先用 list_generation_models 看当前区有哪些模型、各自约束与实测单价。
+2. generate_image / edit_image 是同步调用，一次约 5.7 积分/张，返回 COS 签名 URL
+   （约 24 小时失效），要长期保留请及时下载；需要二进制就传 response_format=b64_json。
+3. generate_video 默认立即返回任务号（202），再用 get_video_task 轮询；传 wait=true
+   才阻塞到出片（可能几十秒到几分钟，一条 5 秒视频约 57~129 积分）。
+4. 模型名使用该出口的上游真实 id；出口由 API Key 绑定或面板默认出口决定。
+5. strip_watermark 是**本地后处理**，不消耗上游积分，但要求画面底部本来就有一条
+   纯白留白（生图常见的水印区）。没有留白会回 422 并给出实测数字，这时先用
+   edit_image 把画面下方约 1/3 涂成纯白，再来裁。
+
+工具的业务失败以 isError: true 返回（HTTP 仍是 200），只有请求信封写坏才是
+JSON-RPC 错误。"""
+#: 生视频任务的终态。出现在这里的 status 意味着「不会再有变化了」，wait=true 的
+#: 阻塞轮询见到就收工。用集合而不是 `== "succeeded"`：失败与取消同样要立刻返回，
+#: 否则调用方会一直等到超时才发现任务早就死了。
+_MCP_TASK_FINAL_STATES = frozenset((
+    "succeeded", "success", "done", "completed", "finished",
+    "failed", "failure", "error", "canceled", "cancelled", "expired",
+))
+#: 去水印允许回读的域名后缀。**只放上游产物域**：这个端点的入参可以是一个 URL，
+#: 如果不收口，它就变成了一个「让网关替我请求任意地址并把响应体编码回来」的
+#: SSRF 探针。产物域是唯一的正当来源，其它来源请调用方自己转 data URL。
+WATERMARK_HOST_SUFFIXES = (".myqcloud.com",)
+#: 下载待裁图片的超时。产物图最大几十 MB，60 秒是「慢但不至于无限等」的折中。
+WATERMARK_FETCH_TIMEOUT = 60.0
+#: 嵌入请求最多换几个账号。与 chat 的重试量级一致：嵌入便宜，但换号要重发整批
+#: 输入，3 次已经足够覆盖「这个号刚好被限流」这种偶发。
+EMBEDDINGS_ROTATE_MAX = 3
+#: 去水印的请求体上限。入参是整张图的 base64，`wb_watermark.MAX_BYTES` 是 32 MB
+#: 原始字节、编码后约 43 MB，再包一层 JSON 信封，48 MB 才够用。
+WATERMARK_MAX_PAYLOAD_BYTES = 48 * 1024 * 1024
 #: 媒体请求体上限。改图的输入图是 data URL：8 MB 原图编码后约 10.7 MB，再包一层
 #: JSON 就逼近通用上限（默认 16 MB，还可能被 max_payload_mb 调小），而那条上限是
 #: 给 chat 定的。媒体单独放宽，且**只放宽不收紧**：用户配得更大就随他。
@@ -383,6 +441,57 @@ class MediaRateLimited(Exception):
 def _as_text(value):
     """非空字符串才算数（`None` / 空串 / 非字符串一律视为"没给"）。"""
     return value if isinstance(value, str) and value.strip() != "" else ""
+
+
+def _mcp_error_text(status, body):
+    """把网关的错误信封压成一句给模型看的话。
+
+    模型读不了 HTTP 状态码，它读的是工具返回的文本。所以这里把 `{"error":
+    {"message": ...}}` 拆出来，前面挂上状态码，剩下的字段（code / retry_after）
+    用紧凑 JSON 补在后面——足够让它判断「是该改参数还是该等一会儿」。
+    """
+    detail = ""
+    message = ""
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            message = _as_text(error.get("message"))
+            extra = {key: error[key] for key in ("code", "retry_after", "reset_at")
+                     if error.get(key) not in (None, "")}
+            if extra:
+                detail = json.dumps(extra, ensure_ascii=False)
+        elif isinstance(error, str):
+            message = error.strip()
+    if not message:
+        message = json.dumps(body, ensure_ascii=False)[:400] if body is not None else ""
+    parts = ["HTTP %d" % status]
+    if message:
+        parts.append(message)
+    if detail:
+        parts.append(detail)
+    return "：".join(parts)
+
+
+def _mcp_task_id(body):
+    """从任务回执里挖出任务 id。
+
+    上游历史上换过字段名（task_id / id / video_id），宽容一点比让调用方猜好：
+    这里只认这三个，且必须是**非空字符串**——返回整数 id 的旧接口并不存在，
+    而把 `True` 当成 id 只会在轮询时变成一个永远查不到的任务。
+    """
+    if not isinstance(body, dict):
+        return ""
+    for key in ("task_id", "id", "video_id"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    task = body.get("task")
+    if isinstance(task, dict):
+        for key in ("task_id", "id"):
+            value = task.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
 
 
 def acquire_media_slot():
@@ -582,6 +691,21 @@ def media_image_prices_path():
     return os.path.join(wb_media_tasks.default_out_dir(), "image-prices.json")
 
 
+def _ensure_prices_dir(path):
+    """落盘前先建目录。
+
+    为什么要有这一步：媒体目录是**第一次跑媒体时才创建**的，账本却可能比它先写
+    ——实测第一次生图时 `media/` 还不存在，`open()` 抛 FileNotFoundError 被
+    `except Exception: pass` 吞掉，内存里明明学到了 0.03，重启就退回 6.0 的估算值，
+    而且没有任何日志痕迹。宁可多一次 makedirs。
+    """
+    if not path:
+        return
+    folder = os.path.dirname(path)
+    if folder and not os.path.isdir(folder):
+        os.makedirs(folder, exist_ok=True)
+
+
 def learn_image_price(model, credit):
     """记下一次生图的实扣（积分/张）。没有 credit 就不记，绝不猜。"""
     model = (model or "").strip()
@@ -597,6 +721,7 @@ def learn_image_price(model, credit):
     with _MEDIA_PRICES_LOCK:
         _MEDIA_IMAGE_PRICES[model] = price
         try:
+            _ensure_prices_dir(_MEDIA_IMAGE_PRICES_PATH)
             with open(_MEDIA_IMAGE_PRICES_PATH, "w", encoding="utf-8") as handle:
                 json.dump(_MEDIA_IMAGE_PRICES, handle, ensure_ascii=False,
                           indent=2, sort_keys=True)
@@ -648,31 +773,33 @@ def load_media_prices():
             parts = (key or "").split("|")
             model = parts[0]
             resolution = parts[1] if len(parts) > 1 else ""
-            with_reference = len(parts) > 2 and parts[2] == "ref"
-            if len(parts) > 2 and parts[2] not in ("", "ref"):
+            tier = parts[2] if len(parts) > 2 else ""
+            if tier not in _PRICE_TIERS:
                 continue
             try:
                 price = float(value)
             except (TypeError, ValueError):
                 continue
             if model and price > 0:
-                _MEDIA_PRICES[(model, resolution, with_reference)] = price
+                _MEDIA_PRICES[(model, resolution, tier)] = price
 
 
 def _save_media_prices_locked():
     path = _MEDIA_PRICES_PATH
     if not path:
         return
-    payload = {("%s|%s" % (model, resolution)) + ("|ref" if ref else ""): price
-               for (model, resolution, ref), price in _MEDIA_PRICES.items()}
+    payload = {("%s|%s|%s" % (model, resolution, tier)).rstrip("|"): price
+               for (model, resolution, tier), price in _MEDIA_PRICES.items()}
     try:
+        _ensure_prices_dir(path)
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
     except Exception:                                    # noqa: BLE001
         pass                                             # 落盘失败不影响派发
 
 
-def learn_media_price(model, resolution, credit, seconds, with_reference=False):
+def learn_media_price(model, resolution, credit, seconds, with_reference=False,
+                      audio=True):
     """用一次已完成任务的实扣反推单价。
 
     三个输入缺一不可：`credit` 为空说明上游没给结算值（failed / lost），
@@ -683,6 +810,11 @@ def learn_media_price(model, resolution, credit, seconds, with_reference=False):
     3 张参考图 + 1 段参考视频、5 秒 768P 实扣 142.86 = 28.572/秒，正好是普通
     768P 14.2857/秒 的 2.00 倍）。两档共用同一个键会互相覆盖——那次实测就把
     768P 的普通单价写成了 28.572，之后所有普通任务报价都会翻倍。
+
+    `audio` 同样单独一档：**关掉声音是另一个价**（2026-11-04 实测 kling-video-v3
+    720P 3 秒：有声 32.37 = 10.79/秒，静音 21.58 = 7.1933/秒，正好 2/3）。同样的
+    覆盖事故已经发生过一次：一条静音任务把 720P 的普通价改成了 7.1933，之后所有
+    默认（有声）任务都被低估 33%。
     """
     model = (model or "").strip()
     if not model:
@@ -696,23 +828,35 @@ def learn_media_price(model, resolution, credit, seconds, with_reference=False):
         return None
     price = round(credit / span, 4)
     with _MEDIA_PRICES_LOCK:
-        _MEDIA_PRICES[_price_key(model, resolution, with_reference)] = price
+        _MEDIA_PRICES[_price_key(model, resolution, with_reference, audio)] = price
         _save_media_prices_locked()
     return price
 
 
-def _price_key(model, resolution, with_reference=False):
-    """账本键：(模型, 分辨率, 是否带参考素材)。"""
-    return ((model or "").strip(), (resolution or "").strip(),
-            bool(with_reference))
+#: 账本第三段（档位）允许的取值：普通 / 带参考素材 / 静音 / 静音+参考素材。
+_PRICE_TIERS = ("", "ref", "mute", "refmute")
+
+
+def _price_key(model, resolution, with_reference=False, audio=True):
+    """账本键：(模型, 分辨率, 档位)。
+
+    档位把「带参考素材」（实测 2 倍）与「静音」（实测 2/3）都编进键里——它们都是
+    真实存在的价差，共用一个键就等于让后一次实测悄悄改掉前一次的报价。
+    """
+    tier = ""
+    if with_reference:
+        tier += "ref"
+    if not audio:
+        tier += "mute"
+    return ((model or "").strip(), (resolution or "").strip(), tier)
 
 
 def media_price_per_second(model, resolution=None, exact_only=False,
-                          with_reference=False):
+                          with_reference=False, audio=True):
     """实测单价（上游 credit ÷ 秒数）；没有观测值返回 None。
 
-    精确匹配 `(模型, 分辨率)` 优先；只有别的分辨率的观测值时取该模型**最大值**
-    ——估算宁可往高报：高估只是可能少派一次，低估会把账号打穿。
+    精确匹配 `(模型, 分辨率, 档位)` 优先；只有别的分辨率的观测值时取该模型**同一档**
+    的**最大值**——估算宁可往高报：高估只是可能少派一次，低估会把账号打穿。
 
     `exact_only=True` 关掉那个"取最大值"的兜底：**报价**必须诚实，把 4K 的价
     填给没观测过的 1080P 就是错报（实测 minimax 2K 比 768P 贵 60%，两者价差
@@ -721,17 +865,18 @@ def media_price_per_second(model, resolution=None, exact_only=False,
     model = (model or "").strip()
     if not model:
         return None
-    tier = bool(with_reference)
+    tier = _price_key(model, resolution, with_reference, audio)[2]
     with _MEDIA_PRICES_LOCK:
-        exact = _MEDIA_PRICES.get(_price_key(model, resolution, tier))
+        exact = _MEDIA_PRICES.get((model, (resolution or "").strip(), tier))
         if exact:
             return exact
         if exact_only:
             return None
         # 兜底只在**同一档**里取最大值：拿"带参考素材"的 2 倍价去估普通任务，
-        # 会把预算算成两倍，害得本来付得起的单子被拦下。
-        same_model = [price for (name, _res, ref), price in _MEDIA_PRICES.items()
-                      if name == model and ref == tier]
+        # 会把预算算成两倍，害得本来付得起的单子被拦下；拿静音的 2/3 价去估
+        # 有声任务则会低估，反向打穿账号。
+        same_model = [price for (name, _res, name_tier), price in _MEDIA_PRICES.items()
+                      if name == model and name_tier == tier]
     return max(same_model) if same_model else None
 
 
@@ -761,9 +906,12 @@ def backfill_media_prices():
         # 改成了 28.572，之后每次重启回填都会再写坏一遍。宁可少学一条。
         if "has_reference_materials" not in task:
             continue
+        # `enable_audio` 老任务里也没有；缺省按有声（上游默认开声），不要反过来
+        # 把静音价当成普通价回填。
         if learn_media_price(task.get("model"), task.get("resolution"),
                              task.get("credit"), task.get("seconds"),
-                             with_reference=bool(task.get("has_reference_materials"))) is not None:
+                             with_reference=bool(task.get("has_reference_materials")),
+                             audio=task.get("enable_audio", True) is not False) is not None:
             learned += 1
     # 生图没有任务表（同步调用），实扣只落在 usage.jsonl 里，也从那儿回填。
     try:
@@ -786,16 +934,18 @@ def backfill_media_prices():
     return learned
 
 
-def media_cost_hint(model, seconds, resolution=None, with_reference=False):
+def media_cost_hint(model, seconds, resolution=None, with_reference=False,
+                    audio=True):
     """派发前的积分估计：有实测价按实测算，没有才退回 26/秒的上界。
 
     `with_reference` 要如实传：带参考素材是另一档价（实测 2 倍），拿普通档估它
-    会低估一半，等于把"付不起"的单子放过去。
+    会低估一半，等于把"付不起"的单子放过去。`audio` 同理（实测静音只要 2/3）。
     """
     return wb_media.estimate_cost(
         "video", seconds,
         price_per_second=media_price_per_second(model, resolution,
-                                                with_reference=with_reference))
+                                                with_reference=with_reference,
+                                                audio=audio))
 
 
 def media_task_finished(task):
@@ -812,13 +962,16 @@ def media_task_finished(task):
         return
     media_key_spend_add(task.get("key"), credit)
     # 用实扣反推单价，下次估算就不必再用一刀切的 26/秒。
+    muted = task.get("enable_audio") is False
     learned = learn_media_price(task.get("model"), task.get("resolution"),
                                 credit, task.get("seconds"),
-                                with_reference=bool(task.get("has_reference_materials")))
+                                with_reference=bool(task.get("has_reference_materials")),
+                                audio=not muted)
     if learned is not None:
-        log("media: 学到 %s（%s%s）单价 %.4f 积分/秒（实扣 %.2f ÷ %s 秒）"
+        log("media: 学到 %s（%s%s%s）单价 %.4f 积分/秒（实扣 %.2f ÷ %s 秒）"
             % (task.get("model"), task.get("resolution") or "默认",
-               "·带参考素材" if task.get("has_reference_materials") else "", learned,
+               "·带参考素材" if task.get("has_reference_materials") else "",
+               "·静音" if muted else "", learned,
                float(credit), task.get("seconds")), tag="media")
     record_usage(task.get("model") or "video", {"credit": credit}, stream=False,
                  account=task.get("account"), outcome="completed",
@@ -828,6 +981,7 @@ def media_task_finished(task):
                  media={"seconds": task.get("seconds"),
                         "resolution": task.get("resolution"),
                         "aspect_ratio": task.get("aspect_ratio"),
+                        "enable_audio": task.get("enable_audio"),
                         "image_to_video": task.get("image_to_video")})
 
 
@@ -852,7 +1006,7 @@ def media_account_by_uid(uid):
 
 
 #: 参考视频/音频里允许自动上传的素材上限（与图片同一档）
-def resolve_reference_uploads(body, realm, model_id, account=None):
+def resolve_reference_uploads(body, realm, model_id, account=None, allowed=None):
     """把 `body` 里参考视频/音频的 data URL 换成**上游抓得到**的 download_url。
 
     为什么必须换：上游对 `video_url` 是**真去下载的**。data URL 与本地路径都抓不到，
@@ -870,7 +1024,8 @@ def resolve_reference_uploads(body, realm, model_id, account=None):
     if not pending:
         return body
     if account is None:
-        account = _pick_media_account_for(realm, model_id, 0, set())
+        account = _pick_media_account_for(
+            realm, model_id, 0, set(), allowed=allowed)
     for kind, inner, label in pending:
         resolved = []
         for entry in body.get(kind) or ():
@@ -891,7 +1046,7 @@ def resolve_reference_uploads(body, realm, model_id, account=None):
     return body
 
 
-def _pick_media_account_for(realm, model_id, cost_hint, excluded):
+def _pick_media_account_for(realm, model_id, cost_hint, excluded, allowed=None):
     """选账号的**模块级**实现（后台提交线程也能用）。
 
     `Handler._pick_media_account` 只是薄薄一层：它把 self 上的 Key 白名单/钉账号
@@ -914,6 +1069,9 @@ def _pick_media_account_for(realm, model_id, cost_hint, excluded):
                 raise wb_media.MediaError("AUTH", str(exc))
             except wb_pool_text.PoolBoundaryBlocked as exc:
                 raise wb_media.MediaError("NO_ROUTE", str(exc))
+        if allowed is not None and pinned.uid not in allowed:
+            raise wb_media.MediaError(
+                "AUTH", "钉住的账号不在本 Key 的绑定范围内")
         if pinned.realm != realm:
             raise wb_media.MediaError(
                 "INVALID_ARGS", "钉住的账号属于 %s 出口，媒体只走 %s" % (pinned.realm, realm))
@@ -926,7 +1084,7 @@ def _pick_media_account_for(realm, model_id, cost_hint, excluded):
         return pinned
     _, medias = _ensure_pools()
     account = (medias.pick(realm=realm, exclude=excluded or set(),
-                           model=model_id)
+                           model=model_id, allowed=allowed)
                if medias is not None else None)
     if account is None:
         return None
@@ -1031,14 +1189,28 @@ def submit_queued_video_task(task):
     # 先把正在跑任务的账号排掉：并行任务摊到不同账号上，别在同一个账号上叠风控。
     excluded = set(store.busy_accounts() or ())
 
+    key_id = task.get("key") or ""
+    if key_id:
+        entry = next((item for item in configured_keys()
+                      if item.get("id") == key_id), None)
+        # A queued task whose key was deleted must not fall back to the whole
+        # pool: that would spend from accounts the key never owned.
+        allowed = (wb_settings.key_allowed_accounts(entry)
+                   if entry is not None else set())
+    else:
+        allowed = None
+
     def pick(avoid):
         try:
-            cost_hint = media_cost_hint(task.get("model"),
-                                        task.get("seconds") or 5,
-                                        task.get("resolution"))
+            cost_hint = media_cost_hint(
+                task.get("model"), task.get("seconds") or 5,
+                task.get("resolution"),
+                with_reference=bool(task.get("has_reference_materials")),
+                audio=task.get("enable_audio") is not False)
         except Exception:
             cost_hint = 0
-        return _pick_media_account_for(realm, model_id, cost_hint, avoid)
+        return _pick_media_account_for(
+            realm, model_id, cost_hint, avoid, allowed=allowed)
 
     account = pick(excluded)
     if account is None:
@@ -1206,9 +1378,103 @@ def client_facing_model(handler, model):
     sent sees a mismatch. Falling back to `model` keeps every un-aliased request
     byte-identical. Module-level so the streaming helpers and the tests that
     drive them with a stub handler can call it too.
+
+    The ``claude-*`` prefix table is the exception: it is not an operator alias
+    the client knows about, it is the only name a Claude client *can* send.
+    Echoing it back would make the user believe Claude answered; ``model`` (the
+    real id) is what the request actually ran on, so that is echoed instead.
     """
+    if str(getattr(handler, "_claude_alias", "") or "").strip():
+        return model
     original = str(getattr(handler, "_client_model", "") or "").strip()
     return original or model
+
+
+def claude_alias_table():
+    """The ``claude-*`` prefix table in force, or ``{}`` when switched off."""
+    try:
+        return wb_settings.effective_claude_aliases(ACCOUNTS_DIR)
+    except Exception:
+        return {}
+
+
+def effort_alias_table():
+    """The effort alias table in force, or ``{}`` when switched off."""
+    try:
+        return wb_settings.effective_effort_aliases(ACCOUNTS_DIR)
+    except Exception:
+        return {}
+
+
+def _supported_efforts(model):
+    """The levels the catalog declares for `model` (empty when unknown)."""
+    try:
+        return model_reasoning_meta(model).get("supportedEfforts") or []
+    except Exception:
+        return []
+
+
+def _apply_claude_model_alias(handler, payload):
+    """Resolve a Claude Desktop ``claude-*`` model name to a real upstream id.
+
+    Claude's "third-party inference" panel only accepts ids shaped like
+    ``claude-*`` and the upstream serves none of them (``claude-sonnet-5`` ->
+    ``400 / 11102``), so the client could not be pointed here at all. The
+    prefix table (settings -> env -> built-in; see ``wb_client_aliases``)
+    resolves the request. Nothing is mapped when the table is empty, so an
+    operator can switch this off and keep the old behaviour byte-for-byte.
+    """
+    table = claude_alias_table()
+    if not table or not isinstance(payload, dict):
+        return ""
+    before, after = wb_client_aliases.apply_claude_alias(payload, table)
+    if not before:
+        return ""
+    try:
+        handler._claude_alias = after
+    except Exception:
+        pass
+    log("alias: claude model %s -> %s" % (before, after))
+    return after
+
+
+def _normalize_effort_in_body(payload, model, handler=None):
+    """Rewrite effort aliases (``xhigh`` / ``ultra``) to a level the model runs.
+
+    Runs before ``map_reasoning_effort`` reads the value: that function rewrites
+    anything the catalog does not declare to the *model default*, which for
+    ``deepseek-v4.1-flash`` is ``high`` - i.e. a client asking for its top level
+    would silently get less thinking than the middle of the range. A model that
+    does publish the level keeps it (``deepseek-v4-pro`` publishes ``xhigh``).
+
+    Logged as ``effort_from`` / ``effort_to`` so "what did the upstream actually
+    receive" is answerable from the log alone (the handoff for this change asked
+    for exactly that).
+    """
+    if not isinstance(payload, dict):
+        return ""
+    table = effort_alias_table()
+    if not table:
+        return ""
+    before, after = wb_client_aliases.normalize_effort(
+        payload, model, table, _supported_efforts(model))
+    if not before:
+        return ""
+    key = "-"
+    if handler is not None:
+        try:
+            key = key_label(handler._key_id()) or "-"
+        except Exception:
+            key = "-"
+    log("effort: model=%s effort_from=%s effort_to=%s key=%s"
+        % (model, before, after, key))
+    return after
+
+
+def _normalize_client_effort(handler, payload):
+    """Request-handler wrapper: normalise the client's effort alias in place."""
+    model = str(payload.get("model") or "") if isinstance(payload, dict) else ""
+    return _normalize_effort_in_body(payload, model, handler)
 
 
 # The WorkBuddy AI desktop app caches its account product config here on every
@@ -1763,6 +2029,8 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     # table existed has no reference and falls back to the timeline.
     if kind == "web":
         row["cost_policy"] = "web"
+    elif kind == "embedding":
+        row["cost_policy"] = "embedding"
     elif kind != "chat":
         # 媒体模型不在 chat 价目表里，current_policy_id() 会给一个 chat 的默认策略，
         # 那会让「按价目表统计」把媒体请求算进某个 chat 策略的样本里。
@@ -1809,6 +2077,27 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     except Exception:
         pass
     return row
+
+
+def key_credit_exhausted(key_entry, key_id):
+    """这个 API Key 的累计积分额度是否已经用完。
+
+    返回 (exhausted, used, limit)。limit <= 0 视为不限，永远 False。
+    「用完」= 已记账积分 >= 上限，与日 token 限量同一口径：不预判本次成本，
+    因此最后一单可能略微超额（积分只有请求结束才知道）。
+    """
+    try:
+        limit = float((key_entry or {}).get("credit_limit") or 0)
+    except (TypeError, ValueError):
+        limit = 0.0
+    if limit <= 0:
+        return False, 0.0, 0.0
+    try:
+        used = wb_keyquota.used(USAGE_DIR, key_id)
+    except Exception as exc:
+        log("credit quota check failed: %s" % (exc,))
+        return False, 0.0, limit
+    return round(used, 8) >= limit, used, limit
 
 
 def record_upstream_usage(upstream, requested_model, usage, **kwargs):
@@ -1933,6 +2222,8 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     row["key"] = key or ""
     if kind == "web":
         row["cost_policy"] = "web"
+    elif kind == "embedding":
+        row["cost_policy"] = "embedding"
     elif kind != "chat":
         row["cost_policy"] = (
             "media" if kind in ("image", "video") else "audio")
@@ -8434,6 +8725,14 @@ def _new_analytics_stat():
         }
 
 
+_MODEL_CREDIT_SAMPLE_FIELDS = ("credit_sample_tokens", "credit_sample_credits",
+                               "credit_sample_requests")
+
+
+def _new_analytics_model_stat():
+    return {**_new_analytics_stat(), **dict.fromkeys(_MODEL_CREDIT_SAMPLE_FIELDS, 0)}
+
+
 # Rows the per-key table folds traffic into when no real key id applies.
 # `before` and `anon` are told apart by whether the row carries a `key` field
 # at all: rows written before this feature existed have none, and their number
@@ -8570,6 +8869,12 @@ def _fold_usage_analytics(row, realm, maps, half, pricing_on=None, also=None,
     _priced_note(priced, row, cost, pricing)
     cost_cny = cost["cny"] if cost["known"] else 0.0
     vals = _analytics_row_values(row)
+    # Zero also means "credit missing" in legacy rows. Pair tokens and credits
+    # only on completed text requests with an actual positive charge.
+    sample_tokens = 0
+    if (not is_err and (row.get("kind") or "chat") == "chat"
+            and vals[5] > 0 and math.isfinite(vals[5])):
+        sample_tokens = max(0, vals[4] or (vals[0] + vals[1]))
     acct_uid = row.get("account") or "(unattributed)"
     m_id = row.get("model") or "(unknown)"
     # A row written before this feature existed has no `key` field at all; a
@@ -8603,8 +8908,13 @@ def _fold_usage_analytics(row, realm, maps, half, pricing_on=None, also=None,
         model = tgt["models"].get(m_id)
         if model is None:
             model = tgt["models"][m_id] = {"model": m_id,
-                                           stat_key: _new_analytics_stat()}
-        _feed_analytics(model[stat_key], vals, is_err, cost_cny)
+                                           stat_key: _new_analytics_model_stat()}
+        model_stat = model[stat_key]
+        _feed_analytics(model_stat, vals, is_err, cost_cny)
+        if sample_tokens:
+            model_stat["credit_sample_tokens"] += sample_tokens
+            model_stat["credit_sample_credits"] += vals[5]
+            model_stat["credit_sample_requests"] += 1
 
         km = tgt["keys"].get(k_id)
         if km is None:
@@ -9049,7 +9359,7 @@ def _merge_analytics_halves(all_maps, win_maps):
         if shared:
             window_stat = dict(stat)
         elif win is None:
-            window_stat = _new_analytics_stat()
+            window_stat = _new_analytics_model_stat()
         else:
             window_stat = win["window"]
         model_map[m_id] = {"model": m_id, "window": window_stat,
@@ -9702,7 +10012,7 @@ def _add_analytics_window_maps(dst, src, half=_ANALYTICS_WINDOW):
         tgt = dst["models"].get(mid)
         if tgt is None:
             tgt = dst["models"][mid] = {"model": mid,
-                                        stat: _new_analytics_stat()}
+                                        stat: _new_analytics_model_stat()}
         _add_analytics_stat(tgt[stat], entry[stat])
     for kid, entry in src["keys"].items():
         tgt = dst["keys"].get(kid)
@@ -11612,6 +11922,11 @@ def _usage_cache_stat_ok(stat):
     return True
 
 
+def _usage_cache_model_stat_ok(stat):
+    return _usage_cache_stat_ok(stat) and all(
+        _usage_cache_number(stat.get(field)) for field in _MODEL_CREDIT_SAMPLE_FIELDS)
+
+
 def _usage_cache_models_ok(models):
     """analytics 的 {model: {requests, tokens, reasoning, cost_cny}} 表。"""
     if not isinstance(models, dict):
@@ -11654,7 +11969,7 @@ def _usage_cache_analytics_window_ok(maps):
             return False
         if not isinstance(entry.get("model"), str):
             return False
-        if not _usage_cache_stat_ok(entry.get("window")):
+        if not _usage_cache_model_stat_ok(entry.get("window")):
             return False
     for kid, entry in keys.items():
         if not isinstance(kid, str) or not isinstance(entry, dict):
@@ -11743,7 +12058,7 @@ def _usage_cache_analytics_ok(maps):
             return False
         if not isinstance(entry.get("model"), str):
             return False
-        if not _usage_cache_stat_ok(entry.get("all_time")):
+        if not _usage_cache_model_stat_ok(entry.get("all_time")):
             return False
     for kid, entry in keys.items():
         if not isinstance(kid, str) or not isinstance(entry, dict):
@@ -12754,6 +13069,10 @@ def runtime_settings_view():
             # daily_token_limit 只存不显会让面板把日限量画成 0，用户以为没设过，
             # 再保存一次就把真实值写回 0（与 #592 同类的坑）。
             "daily_token_limit": int(entry.get("daily_token_limit") or 0),
+            # credit_limit 同理：累计积分额度（0 = 不限）。顺带回一个已用量，
+            # 面板才能显示「已用 / 上限」，否则每次都画成 0 让人以为没设过。
+            "credit_limit": float(entry.get("credit_limit") or 0),
+            "credit_used": round(wb_keyquota.used(USAGE_DIR, entry.get("id") or ""), 2),
             # concurrency_limit 上游只存不显：面板读不到就显示 0，用户以为没设过，
             # 再保存一次又把真实值写回 0。
             "concurrency_limit": int(entry.get("concurrency_limit") or 0),
@@ -12809,6 +13128,12 @@ def runtime_settings_view():
         "model_aliases_enabled": wb_settings.model_aliases_enabled(ACCOUNTS_DIR),
         "unified_models": wb_settings.unified_models(ACCOUNTS_DIR),
         "unified_models_enabled": wb_settings.unified_models_enabled(ACCOUNTS_DIR),
+        # 客户端直连用的两张表：claude-* 前缀映射、推理档位别名。返回生效值
+        # （环境变量与内置默认已合并），面板只需展示与覆盖。
+        "claude_aliases": wb_settings.effective_claude_aliases(ACCOUNTS_DIR),
+        "claude_aliases_enabled": wb_settings.claude_aliases_enabled(ACCOUNTS_DIR),
+        "effort_aliases": wb_settings.effective_effort_aliases(ACCOUNTS_DIR),
+        "effort_aliases_enabled": wb_settings.effort_aliases_enabled(ACCOUNTS_DIR),
         "filter_models_by_key": wb_settings.filter_models_by_key(ACCOUNTS_DIR),
         "reasoning_effort_map": wb_settings.reasoning_effort_map(ACCOUNTS_DIR),
         "models_only_available": wb_settings.models_only_available(ACCOUNTS_DIR),
@@ -12880,6 +13205,13 @@ def runtime_settings_view():
         "media_limits": dict(wb_settings.MEDIA_LIMITS),
         "media_minimums": dict(wb_settings.MEDIA_MINIMUMS),
         "media_realms": list(wb_settings.MEDIA_REALMS),
+        # 去水印与嵌入。同样默认关；读回去面板才知道开关该画在哪一格。
+        "watermark": wb_settings.watermark_config(ACCOUNTS_DIR),
+        "watermark_minimums": dict(wb_settings.WATERMARK_MINIMUMS),
+        "watermark_limits": dict(wb_settings.WATERMARK_LIMITS),
+        "embeddings": wb_settings.embeddings_config(ACCOUNTS_DIR),
+        "embeddings_minimums": dict(wb_settings.EMBEDDINGS_MINIMUMS),
+        "embeddings_limits": dict(wb_settings.EMBEDDINGS_LIMITS),
         "log_db_enabled": wb_settings.log_db_enabled(ACCOUNTS_DIR),
         "stats_tz_beijing": wb_settings.stats_tz_beijing(ACCOUNTS_DIR),
         "log_db_max_rows": wb_settings.log_db_max_rows(ACCOUNTS_DIR),
@@ -12918,7 +13250,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "2.2.5",
+        "version": "2.2.8",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -17016,9 +17348,17 @@ def build_starved_retry_body(body, floor=0):
 
 def build_upstream_body(payload):
     model = payload.get("model") or ""
-    # Map an unsupported level before anything below reads the effort, so the
-    # thinking backfill and the logged level describe what will actually run.
-    payload = map_reasoning_effort(dict(payload), model)
+    # Two rewrites before anything below reads the effort, in this order:
+    #   1. the client's alias for "more than the picker allows" (xhigh/ultra)
+    #      becomes the level this build actually runs at;
+    #   2. an unsupported level becomes the catalog default.
+    # Reversing them would let step 2 turn xhigh into the model default (high)
+    # before step 1 ever sees it. Bodies built in-process (probes, agent config,
+    # sub-bridge) never pass the request handler, so the normalisation happens
+    # here as well; it is idempotent, so an already-rewritten request is a no-op.
+    payload = dict(payload)
+    _normalize_effort_in_body(payload, model)
+    payload = map_reasoning_effort(payload, model)
     # Resolve the effective thinking state before the backfill below: while
     # thinking is on, the upstream requires reasoning_content on every
     # assistant message, whether or not the client kept a reasoning trace.
@@ -22923,6 +23263,14 @@ class Handler(BaseHTTPRequestHandler):
     # 与 _json_etag 同一个理由放成实例属性：测试里三十来个 Handler 桩只覆写
     # 了 _json(code, obj)，加参数会让它们全部报错，而属性对它们完全无感。
     _json_extra_headers = None
+    # 响应捕获槽。非 None 时 _json()/_error()/_rate_limited() 不再写 socket，
+    # 而是把 (status, body) 存进这个元组。MCP 的 tools/call 靠它把工具参数当
+    # 请求体喂给既有的 REST 处理路径（见 _capture_call），从而与 REST 共用同一条
+    # 选号 / 换号 / 计费 / 台账逻辑——两套实现迟早会出现两套账。
+    #
+    # 放成类属性而不是在 __init__ 里设：Handler 没有 __init__（BaseHTTPRequestHandler
+    # 的构造签名只接受连接参数），而测试里的 Handler 桩大量直接调 _json()。
+    _capture = None
     # The stdlib default caps the request line at 64KB and answers an opaque
     # bare "414 Request-URI Too Long" for anything longer. Raise it and reply in
     # the normal JSON error shape so an over-long URL is diagnosable.
@@ -22990,7 +23338,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/2.2.5"
+    server_version = "wb-proxy/2.2.8"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -23008,6 +23356,10 @@ class Handler(BaseHTTPRequestHandler):
             pass
         log(fmt % args)
     def _json(self, code, obj):
+        if getattr(self, "_capture", None) is not None:
+            # 内部复用（MCP tools/call）：把响应收进槽里，一个字节都不发。
+            self._capture = (code, obj)
+            return
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -23319,6 +23671,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
     def _error(self, code, message, err_type="server_error", reset_at=None):
+        if getattr(self, "_capture", None) is not None:
+            # 内部复用（MCP tools/call）：body 早被外层读走了，这里绝不能走到下面
+            # 的 _discard_body()（它会等一份永远不来的数据），只把错误形状收进槽里。
+            self._capture = (code, {"error": {
+                "message": message, "type": err_type, "code": code}})
+            return
         # Every early rejection funnels through here, so draining the body in
         # one place covers all of them. Unblock any client still waiting on
         # "Expect: 100-continue" first, otherwise it never sends the body and
@@ -23376,6 +23734,18 @@ class Handler(BaseHTTPRequestHandler):
         if exc.detail and not custom:
             detail = " - " + exc.detail[:200]
         reset_at = rate_limit_reset_at(exc)
+        if getattr(self, "_capture", None) is not None:
+            # 内部复用（MCP tools/call）：同 _error，跳过 body 排空，只收形状。
+            error = {
+                "message": text + detail + rate_limit_reset_note(reset_at),
+                "type": "rate_limit_error",
+                "code": 429,
+                "retry_after": wait,
+            }
+            if reset_at:
+                error["reset_at"] = int(reset_at)
+            self._capture = (429, {"error": error})
+            return
         # 429 can be answered before the body is read (the model cooldown is
         # checked on the way in), so drain it exactly like _error does.
         self._handle_expect_continue()
@@ -23441,6 +23811,61 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def _data_backup(self, action):
+        if not self._panel_ok():
+            self.close_connection = True
+            return self._error(401, "panel password required", "invalid_request_error")
+        data = wb_data_backup.roots(ACCOUNTS_DIR, USAGE_DIR)
+        if action == "export":
+            try:
+                with wb_data_backup.export_file(data) as archive:
+                    wb_data_backup.write_zip(data, archive)
+                    size = archive.tell()
+                    archive.seek(0)
+                    name = "workbuddy-data-" + wb_time.strftime("%Y%m%d-%H%M%S") + ".zip"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Disposition", 'attachment; filename="%s"' % name)
+                    self.send_header("Content-Length", str(size))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    try:
+                        shutil.copyfileobj(archive, self.wfile, wb_data_backup.CHUNK)
+                    except OSError:
+                        self.close_connection = True
+            except wb_data_backup.BackupError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            except Exception as exc:
+                log("data backup export failed: %s" % type(exc).__name__, level="WARN")
+                return self._error(500, "Could not create the backup.", "server_error")
+            return
+        try:
+            if action == "status":
+                result = wb_data_backup.status(data)
+            elif action == "import":
+                try:
+                    size = int(self.headers.get("Content-Length") or "0")
+                except ValueError:
+                    size = 0
+                if self.headers.get("Transfer-Encoding") or not 0 < size <= wb_data_backup.MAX_BYTES:
+                    self.close_connection = True
+                    return self._error(413, "Backup upload size is out of range.", "invalid_request_error")
+                self._handle_expect_continue()
+                result = wb_data_backup.stage(data, self.rfile, size)
+            else:
+                payload = self._payload_or_error()
+                if payload is None:
+                    return
+                result = wb_data_backup.choose(data, payload.get("id"), action == "confirm")
+        except wb_data_backup.BackupError as exc:
+            self.close_connection = True
+            return self._error(400, str(exc), "invalid_request_error")
+        except Exception as exc:
+            self.close_connection = True
+            log("data backup operation failed: %s" % type(exc).__name__, level="WARN")
+            return self._error(500, "The backup operation could not be completed.", "server_error")
+        return self._json_panel(200, result)
     def _supplied_key(self):
         """The key the caller presented.
 
@@ -23803,6 +24228,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_codearts_oauth_callback(query)
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
+        if path == MCP_PATH:
+            # MCP 是无状态单发请求，GET 没有意义。明确回 405 + Allow，而不是
+            # 让它掉进 404：客户端据此能分清「端点存在但方法不对」和「路径写错了」。
+            self.send_response(405)
+            self.send_header("Allow", "POST")
+            self.send_header("Content-Length", "0")
+            if cors_origin_allowed(path):
+                self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
         if path in ("/", "/dashboard", "/ui"):
             return self._get_dashboard()
         if path == "/panel/status":
@@ -23869,6 +24304,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_pricing()
         if path == "/settings":
             return self._get_settings()
+        if path == "/settings/data-backup":
+            return self._data_backup("status")
+        if path == "/settings/data-backup/export":
+            return self._data_backup("export")
         if path == "/updates":
             return self._get_updates()
         if path == "/updates/backups":
@@ -25157,23 +25596,27 @@ class Handler(BaseHTTPRequestHandler):
             b'data-ui-language="__WB_UI_LANGUAGE__"',
             ('data-ui-language="%s"' % language).encode("utf-8"),
         )
+        # Snapshot the persisted exit for the first paint and for the ETag.
+        # The view selector follows its own state, including ?view= overrides.
+        realm = CURRENT_REALM
+        realm_label = {"codearts": "CodeArts", "cn": "国内版"}.get(realm)
+        if realm_label:
+            body = body.replace(b'data-gateway-realm="intl"',
+                                ('data-gateway-realm="%s"' % realm).encode("ascii"), 1)
+            body = body.replace(
+                '<span id="headerRealmName">国际版</span>'.encode("utf-8"),
+                ('<span id="headerRealmName">%s</span>' % realm_label).encode("utf-8"), 1)
         # 面板首页是纯静态资源（服务端逐字节原样发出、不含任何机密），所以可以
         # 允许浏览器存储副本、每次打开再回源校验：校验命中回 304（无 body），
         # 省下整页（约 470KB）的重复下载，手机 / Tailscale 远程访问体感最明显。
         #
-        # 校验符必须覆盖**所有**影响响应体的输入，不只是文件本身：body 还取决于
-        # 上面注入的 ui_language——用户改一次界面语言，文件没动、body 却变了；
-        # 若 tag 只看文件，客户端带旧 tag 回来会拿到 304 + 旧语言的页面。所以 tag
-        # 由 (文件 mtime_ns, size, language) 三者派生：前两个代表文件字节（本文件
-        # 只在应用更新时被整体替换、从不原地修改），第三个就是本次实际注入的值，
-        # 三者组合变化 ⇔ 响应字节变化。mtime 用纳秒精度，同一秒内的两次替换也能
-        # 得到不同 tag。
+        # 文件、面板语言或默认出口任一变化时，浏览器都要重新读取首页。
         etag = None
         try:
             st = os.stat(DASHBOARD_HTML)
-            # 强校验符（不带 W/ 前缀）：响应是「文件字节 + 本次语言」的精确副本，
+            # 强校验符（不带 W/ 前缀）：覆盖文件字节与本次注入值，
             # tag 变 ⇔ 字节变。
-            etag = '"%x-%x-%s"' % (st.st_mtime_ns, st.st_size, language)
+            etag = '"%x-%x-%s-%s"' % (st.st_mtime_ns, st.st_size, language, realm)
         except Exception:
             # stat 取不到（或时间戳无法表示）不是致命错误：退化为一律按普通
             # 200 处理，只是这一次没有条件请求支持，绝不让面板页本身打不开。
@@ -25278,10 +25721,15 @@ class Handler(BaseHTTPRequestHandler):
         if length < 0:
             raise BadJSON()
         try:
-            raw = self.rfile.read(length).decode("utf-8") if length else "{}"
+            raw_bytes = self.rfile.read(length) if length else b"{}"
             # Mark the body as taken so a later error reply does not try to
             # drain the same bytes again (that read would block forever).
+            # Set this BEFORE decoding UTF-8 / JSON so binary bodies (e.g.
+            # multipart sent to a JSON-only route) fail immediately with 400.
             self._body_consumed = True
+            if length and len(raw_bytes) != length:
+                raise BadJSON()
+            raw = raw_bytes.decode("utf-8")
             data = json.loads(raw or "{}")
         except Exception:
             raise BadJSON()
@@ -25349,17 +25797,653 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._error(400, "invalid JSON body", "invalid_request_error")
             return None
+    # ------------------------------------------------------------ MCP（JSON-RPC 工具面）
+
+    def _empty_response(self, code):
+        """回一个没有 body 的响应。MCP 的 202（通知已收到）走这里。"""
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        if cors_origin_allowed(getattr(self, "path", "") or ""):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        try:
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+
+    def _capture_call(self, fn, *args):
+        """跑一段既有的 REST 处理路径，把它写出的响应截获成 `(status, body)`。
+
+        MCP 的工具参数在这里被当成 REST 请求体喂进去，于是选号、换号、计费、
+        台账全部复用同一份代码——两套实现迟早会算出两套账。代价是绕过 HTTP 层，
+        所以 MCP 发起的调用不会在**请求台账**里单独占一行（媒体自己的记账照旧）。
+        """
+        saved = self._capture
+        self._capture = (None, None)
+        try:
+            fn(*args)
+        finally:
+            captured = self._capture
+            self._capture = saved
+        status, body = captured if isinstance(captured, tuple) else (None, None)
+        if status is None:
+            # 处理路径既没写响应也没报错：这属于代码缺陷，但不能让整个 MCP 端点
+            # 跟着崩，回一个可诊断的 502 让调用方看到是哪一步没说话。
+            return 502, {"error": {"message": "内部调用没有产生响应",
+                                   "type": "server_error", "code": 502}}
+        return status, body
+
+    def _handle_mcp(self):
+        """`POST /mcp`：JSON-RPC 2.0 单发请求。协议细节全在 wb_mcp 里。"""
+        try:
+            payload = self._read_payload(
+                max_bytes=wb_mcp.MAX_BODY_BYTES, allow_list=False)
+        except BodyTooLarge as exc:
+            self._reject_body_after_reply = True
+            self._json(200, wb_mcp.parse_error(
+                "body too large (%d bytes > %d)" % (exc.length, wb_mcp.MAX_BODY_BYTES)))
+            self._drain_rejected_body(exc.length)
+            self.close_connection = True
+            return
+        except BadJSON:
+            # 解析失败也必须是 JSON-RPC 的 -32700，而不是网关惯用的 400 信封：
+            # MCP 客户端按协议解析错误，给它 OpenAI 形状等于没回。
+            self._json(200, wb_mcp.parse_error())
+            return
+        status, body = wb_mcp.dispatch(
+            payload, self._mcp_tools, self._mcp_call_tool,
+            instructions=MCP_INSTRUCTIONS,
+            version=self.server_version.split("/", 1)[-1])
+        if body is None:
+            self._empty_response(status)
+            return
+        self._json(status, body)
+
+    def _mcp_tools(self):
+        """当前可用的工具清单。去水印关着就**不出现**，而不是出现后报错。"""
+        tools = [
+            {
+                "name": "list_generation_models",
+                "description": "列出当前出口可用的生图 / 生视频模型，含各自约束与实测单价。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["image", "video"],
+                            "description": "image=生图/改图模型，video=生视频模型（默认 image）",
+                        },
+                        "realm": {
+                            "type": "string",
+                            "enum": ["cn", "intl"],
+                            "description": "出口；不给则用面板配置的默认出口",
+                        },
+                    },
+                },
+            },
+            {
+                "name": "generate_image",
+                "description": "文生图，同步返回 COS 签名 URL（约 24 小时失效）。一次约 5.7 积分。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string", "description": "画面描述（必填）"},
+                        "model": {"type": "string", "description": "模型 id；不给则用该区默认模型"},
+                        "size": {"type": "string", "description": "如 1024x1024"},
+                        "quality": {"type": "string", "description": "质量档位，透传上游"},
+                        "n": {"type": "integer", "description": "生成几张（默认 1）"},
+                        "response_format": {
+                            "type": "string", "enum": ["url", "b64_json"],
+                            "description": "url（默认）或 b64_json；后者网关自己下载再编码",
+                        },
+                    },
+                    "required": ["prompt"],
+                },
+            },
+            {
+                "name": "edit_image",
+                "description": "改图 / 图生图，同步返回 COS 签名 URL。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string", "description": "改动要求（必填）"},
+                        "image": {
+                            "description": "输入图：data URL、公网 http(s) URL，或字符串数组",
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}},
+                            ],
+                        },
+                        "model": {"type": "string"},
+                        "size": {"type": "string"},
+                        "quality": {"type": "string"},
+                        "n": {"type": "integer"},
+                        "response_format": {"type": "string", "enum": ["url", "b64_json"]},
+                    },
+                    "required": ["prompt", "image"],
+                },
+            },
+            {
+                "name": "generate_video",
+                "description": "生视频。默认立即返回任务（202 + id），wait=true 则阻塞到出片。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string", "description": "画面描述（必填）"},
+                        "image": {"type": "string", "description": "首帧：data URL 或公网 http(s) URL"},
+                        "model": {"type": "string"},
+                        "seconds": {"type": "integer", "description": "时长（秒），受模型与面板上限约束"},
+                        "resolution": {"type": "string", "description": "如 720p"},
+                        "aspect_ratio": {"type": "string", "enum": ["16:9", "9:16", "1:1"]},
+                        "negative_prompt": {"type": "string"},
+                        "enable_audio": {"type": "boolean"},
+                        "watermark": {"type": "boolean"},
+                        "reference_images": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": "参考图数组（data URL 或公网 URL）",
+                        },
+                        "wait": {
+                            "type": "boolean",
+                            "description": "true = 阻塞到任务结束（默认 false，立刻返回任务）",
+                        },
+                        "timeout_seconds": {
+                            "type": "number",
+                            "description": "wait=true 时的等待上限，默认 300，最大 900",
+                        },
+                    },
+                    "required": ["prompt"],
+                },
+            },
+            {
+                "name": "get_video_task",
+                "description": "查生视频任务的状态与产物地址。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string", "description": "任务 id（必填）"},
+                    },
+                    "required": ["task_id"],
+                },
+            },
+        ]
+        try:
+            watermark_on = bool(wb_settings.watermark_config(ACCOUNTS_DIR)["enabled"])
+        except Exception:
+            watermark_on = False
+        if watermark_on:
+            tools.append({
+                "name": "strip_watermark",
+                "description": ("裁掉图片底部的纯白留白（生图水印区）。本地后处理，"
+                                "不消耗上游积分。"),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "image": {"type": "string",
+                                  "description": "data URL、上游产物域 URL，或裸 base64"},
+                        "min_blank_px": {"type": "integer",
+                                         "description": "留白至少多少像素才算可裁（默认 90）"},
+                        "keep_blank": {"type": "integer",
+                                       "description": "裁切后额外保留多少行留白（默认 0）"},
+                        "format": {"type": "string", "enum": ["png", "jpeg"],
+                                   "description": "输出格式；不给则跟随输入"},
+                        "quality": {"type": "integer", "description": "JPEG 质量 1-100（默认 92）"},
+                    },
+                    "required": ["image"],
+                },
+            })
+        return tools
+
+    def _mcp_call_tool(self, name, arguments):
+        """执行一个工具。业务失败抛 ToolError（→ isError:true），不是 RPC 错误。"""
+        handlers = {
+            "list_generation_models": self._mcp_list_models,
+            "generate_image": self._mcp_generate_image,
+            "edit_image": self._mcp_edit_image,
+            "generate_video": self._mcp_generate_video,
+            "get_video_task": self._mcp_get_video_task,
+            "strip_watermark": self._mcp_strip_watermark,
+        }
+        handler = handlers.get(name)
+        if handler is None:
+            raise wb_mcp.ToolError("没有这个工具：%s" % name)
+        status, body = handler(arguments)
+        if status >= 400:
+            raise wb_mcp.ToolError(_mcp_error_text(status, body))
+        return body
+
+    def _mcp_list_models(self, arguments):
+        kind = arguments.get("kind") or "image"
+        if kind not in ("image", "video"):
+            raise wb_mcp.ToolError("kind 只能是 image 或 video")
+        tag = (wb_media.TAG_TEXT_TO_VIDEO if kind == "video"
+               else wb_media.TAG_TEXT_TO_IMAGE)
+        query = {"tag": [tag]}
+        realm = arguments.get("realm")
+        if isinstance(realm, str) and realm.strip():
+            query["realm"] = [realm.strip()]
+        return self._capture_call(self._get_media_models, query)
+
+    def _mcp_image_payload(self, arguments, edit):
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise wb_mcp.ToolError("prompt 必填，且必须是非空字符串")
+        payload = {"prompt": prompt}
+        for key in ("model", "size", "quality", "response_format"):
+            value = arguments.get(key)
+            if value is not None:
+                payload[key] = value
+        if arguments.get("n") is not None:
+            payload["n"] = arguments["n"]
+        if edit:
+            image = arguments.get("image")
+            if image is None or image == "" or image == []:
+                raise wb_mcp.ToolError("image 必填（改图要带输入图）")
+            payload["image"] = image
+        return payload
+
+    def _mcp_billable_media_call(self, fn, *args):
+        """Run one MCP media tool under the same key limits as REST.
+
+        `/mcp` is dispatched before the generic POST path, so it would otherwise
+        bypass both the key's cumulative credit quota and its concurrency slot.
+        Only billable tools go through here; listing models, polling a task and
+        local watermark stripping do not occupy a key slot.
+        """
+        hit, used, limit = key_credit_exhausted(self.key_entry, self._key_id())
+        if hit:
+            name = (self.key_entry or {}).get("name") or self._key_id() or "current key"
+            raise wb_mcp.ToolError(
+                "Credit quota exhausted for API key '%s' (%.2f of %g credits used); "
+                "raise the limit for this key in the panel to continue"
+                % (name, used, limit))
+        ok, current, maximum = _acquire_key_slot(self.key_entry)
+        if not ok:
+            name = (self.key_entry or {}).get("name") or self._key_id() or "current key"
+            raise wb_mcp.ToolError(
+                "Rate limit reached: API key '%s' reached its concurrency limit "
+                "(%d in flight); retry shortly" % (name, maximum))
+        try:
+            return self._capture_call(fn, *args)
+        finally:
+            _release_key_slot(self.key_entry)
+
+    def _mcp_generate_image(self, arguments):
+        payload = self._mcp_image_payload(arguments, edit=False)
+        return self._mcp_billable_media_call(
+            self._handle_media_post, "/v1/images/generations", payload)
+
+    def _mcp_edit_image(self, arguments):
+        payload = self._mcp_image_payload(arguments, edit=True)
+        return self._mcp_billable_media_call(
+            self._handle_media_post, "/v1/images/edits", payload)
+
+    def _mcp_generate_video(self, arguments):
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise wb_mcp.ToolError("prompt 必填，且必须是非空字符串")
+        payload = {"prompt": prompt}
+        for key in ("image", "model", "seconds", "resolution", "aspect_ratio",
+                    "negative_prompt", "enable_audio", "watermark",
+                    "reference_images"):
+            value = arguments.get(key)
+            if value is not None:
+                payload[key] = value
+        status, body = self._mcp_billable_media_call(
+            self._handle_media_post, "/v1/videos", payload)
+        if status >= 400 or arguments.get("wait") is not True:
+            return status, body
+        task_id = _mcp_task_id(body)
+        if not task_id:
+            return status, body
+        try:
+            timeout = float(arguments.get("timeout_seconds"))
+        except (TypeError, ValueError):
+            timeout = 300.0
+        timeout = max(5.0, min(timeout, 900.0))
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            task = media_tasks().get(task_id)
+            if not self._media_task_visible(task):
+                return status, body
+            public = self._media_task_public(task)
+            if str(public.get("status") or "") in _MCP_TASK_FINAL_STATES:
+                return 200, public
+            time.sleep(2.0)
+        task = media_tasks().get(task_id)
+        public = self._media_task_public(task) if task else dict(body)
+        public["hint"] = ("等待 %d 秒仍未出片，任务仍在后台跑；"
+                          "用 get_video_task 继续查 %s" % (int(timeout), task_id))
+        return 200, public
+
+    def _mcp_get_video_task(self, arguments):
+        task_id = arguments.get("task_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            task_id = _mcp_task_id(arguments)
+        if not task_id:
+            raise wb_mcp.ToolError("task_id 必填")
+        return self._capture_call(
+            self._get_media_video, "/v1/videos/%s" % task_id.strip(), {})
+
+    def _mcp_strip_watermark(self, arguments):
+        return self._capture_call(self._handle_watermark_post, dict(arguments))
+
+    # ------------------------------------------------------------ 去水印（本地后处理）
+
+    def _handle_watermark_post(self, payload):
+        """`POST /v1/images/strip-watermark`：裁掉底部纯白留白。
+
+        开关关着回 **403 而不是 404**：这条路径的存在本身不是秘密（README 里写着），
+        回 403 能让调用方一眼看出「功能在，只是没开」，比一个让人怀疑拼错路径的
+        404 有用。
+        """
+        config = wb_settings.watermark_config(ACCOUNTS_DIR)
+        if not config["enabled"]:
+            return self._error(
+                403, "watermark strip is disabled (settings.watermark.enabled = false)",
+                "invalid_request_error")
+        raw = payload.get("image")
+        try:
+            kind, value = wb_watermark.classify_input(raw)
+            if kind == "url":
+                data = self._watermark_fetch(value)
+            elif kind == "data":
+                try:
+                    data = base64.b64decode(value, validate=True)
+                except Exception:
+                    raise wb_watermark.NotImageError("data URL 的 base64 解不开")
+            else:
+                try:
+                    data = base64.b64decode(value, validate=True)
+                except Exception:
+                    raise wb_watermark.NotImageError("image 既不是 URL 也不是合法 base64")
+            if len(data) > wb_watermark.MAX_BYTES:
+                raise wb_watermark.TooLargeError(
+                    "图片超过 %d 字节上限" % wb_watermark.MAX_BYTES)
+            result, output = wb_watermark.strip(
+                data,
+                min_blank_px=payload.get("min_blank_px"),
+                keep_blank=payload.get("keep_blank"),
+                fmt=payload.get("format") or "",
+                quality=payload.get("quality"),
+                white_lum=config["white_lum"])
+        except wb_watermark.StripError as exc:
+            body = dict(exc.result or {})
+            body["error"] = {"message": exc.message, "type": "invalid_request_error",
+                             "code": exc.code}
+            return self._json(exc.status, body)
+        if _as_text(payload.get("return")) == "meta":
+            return self._json(200, result)
+        body = dict(result)
+        mime = "image/png" if result["format"] == "png" else "image/jpeg"
+        body["data_url"] = "data:%s;base64,%s" % (
+            mime, base64.b64encode(output).decode("ascii"))
+        return self._json(200, body)
+
+    def _watermark_fetch(self, url):
+        """取 URL 上的图。**只允许上游产物域，且不跟随重定向。**
+
+        跟随一次 302 就能把请求带去任意地址，所以这里连 3xx 都不接受：产物域本来
+        就不做重定向。其它来源请调用方自己转成 data URL / base64 再传——那也顺便
+        让「这张图是从哪来的」变成调用方的显式决定，而不是网关替他决定。
+        """
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise wb_watermark.NotImageError("image 的 URL 只接受 http(s)")
+        host = (parsed.hostname or "").lower()
+        if not any(host == suffix.lstrip(".") or host.endswith(suffix)
+                   for suffix in WATERMARK_HOST_SUFFIXES):
+            raise wb_watermark.NotImageError(
+                "image 的 URL 只允许上游产物域（%s）；其它来源请传 data URL 或 base64"
+                % ", ".join(WATERMARK_HOST_SUFFIXES))
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect())
+        request = urllib.request.Request(url, method="GET")
+        try:
+            resp = opener.open(request, timeout=WATERMARK_FETCH_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                raise wb_watermark.NotImageError(
+                    "产物地址回了 %d 重定向，本端点不跟随" % exc.code)
+            raise wb_watermark.NotImageError("下载 image 失败：HTTP %d" % exc.code)
+        except Exception as exc:
+            raise wb_watermark.NotImageError("下载 image 失败：%s" % exc)
+        try:
+            data = resp.read(wb_watermark.MAX_BYTES + 1)
+        except Exception as exc:
+            raise wb_watermark.NotImageError("读取 image 失败：%s" % exc)
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        if len(data) > wb_watermark.MAX_BYTES:
+            raise wb_watermark.TooLargeError(
+                "图片超过 %d 字节上限" % wb_watermark.MAX_BYTES)
+        return data
+
+    # ------------------------------------------------------------ 文本嵌入
+
+    def _handle_embeddings_post(self, payload):
+        """`POST /v1/embeddings`：OpenAI 形状的嵌入接口。
+
+        换号与 chat 同一套：命中账号级错误就不换（换号继续打同一台设备会把同设备
+        的其它账号一起送走），其余可重试错误最多换 `EMBEDDINGS_ROTATE_MAX` 个号。
+        """
+        config = wb_settings.embeddings_config(ACCOUNTS_DIR)
+        if not config["enabled"]:
+            return self._error(
+                403, "embeddings is disabled (settings.embeddings.enabled = false)",
+                "invalid_request_error")
+        model = payload.get("model")
+        if not isinstance(model, str) or not model.strip():
+            model = config["model"]
+        model, realm_hint = wb_embeddings.strip_realm_prefix(model)
+        if not model:
+            return self._error(400, "model 不能为空", "invalid_request_error")
+        # Embedding ids live in a separate registry, but the operator's key
+        # allow-list is still an authorization boundary. A key restricted to
+        # chat models must not silently gain bge-m3 access through this route.
+        blocked = self._key_model_error(model)
+        if blocked:
+            return self._error(400, blocked, "invalid_request_error")
+        try:
+            inputs = wb_embeddings.normalize_input(payload.get("input"))
+        except wb_embeddings.EmbeddingError as exc:
+            return self._error(exc.status, exc.message, "invalid_request_error")
+        if len(inputs) > config["max_inputs"]:
+            return self._error(
+                400, "一次最多 %d 条 input（给了 %d 条）"
+                % (config["max_inputs"], len(inputs)), "invalid_request_error")
+        bound = self._key_realm()
+        if bound and realm_hint and realm_hint != bound:
+            return self._error(
+                409,
+                "model 前缀要求 %s 出口，但当前 API Key 绑定的是 %s 出口"
+                % (realm_hint, bound),
+                "invalid_request_error")
+        # 与媒体同一套优先级：Key 绑定的出口 > model 前缀 > 面板默认出口。
+        realm = bound or realm_hint or CURRENT_REALM
+        excluded = set()
+        tried = 0
+        last = None
+        started = time.time()
+        while tried < EMBEDDINGS_ROTATE_MAX:
+            try:
+                account = self._pick_embedding_account(realm, model, excluded)
+            except wb_embeddings.EmbeddingError as exc:
+                return self._embeddings_error(exc)
+            slot_ok = account_slot_acquire(account)
+            if not slot_ok:
+                excluded.add(account.uid)
+                tried += 1
+                continue
+            try:
+                raw = wb_embeddings.request(account, model, inputs)
+            except wb_embeddings.EmbeddingError as exc:
+                last = exc
+                if exc.code == "account_restricted":
+                    try:
+                        account.note_restricted(detail=exc.message)
+                    except Exception:
+                        pass
+                    try:
+                        _persist_restriction(account)
+                        note_account_restriction(realm, account.uid)
+                    except Exception:
+                        pass
+                    record_error(
+                        model, exc.status, exc.message,
+                        elapsed_ms=(time.time() - started) * 1000.0,
+                        account=account.uid, realm=realm,
+                        key=self._key_id(), kind="embedding")
+                    return self._embeddings_error(exc)
+                if exc.code in ("model_not_found", "invalid_request"):
+                    # 与账号无关：换号只会把同一个错误重放一遍，还白烧一次请求。
+                    break
+                if exc.code == "upstream_busy":
+                    break
+                try:
+                    account.note_error(exc.message, model=model)
+                except Exception:
+                    pass
+                excluded.add(getattr(account, "uid", ""))
+                tried += 1
+                continue
+            finally:
+                account_slot_release(account)
+            try:
+                result = wb_embeddings.parse_response(raw, len(inputs))
+            except Exception:
+                result = None
+            if result is None:
+                exc = wb_embeddings.EmbeddingError(
+                    "upstream_error", "上游响应格式不正确", 502)
+                record_error(
+                    model, exc.status, exc.message,
+                    elapsed_ms=(time.time() - started) * 1000.0,
+                    account=account.uid, realm=realm,
+                    key=self._key_id(), kind="embedding")
+                return self._embeddings_error(exc)
+            try:
+                account.note_success(model=model)
+            except Exception:
+                pass
+            usage = raw.get("usage") if isinstance(raw, dict) else None
+            record_usage(
+                model, usage if isinstance(usage, dict) else {},
+                stream=False,
+                elapsed_ms=(time.time() - started) * 1000.0,
+                account=account.uid, outcome="completed",
+                key=self._key_id(), realm=realm, kind="embedding")
+            return self._json(200, result)
+        if last is None:
+            return self._error(503, "no available account", "server_error")
+        record_error(
+            model, last.status, last.message,
+            elapsed_ms=(time.time() - started) * 1000.0,
+            realm=realm, key=self._key_id(), kind="embedding")
+        return self._embeddings_error(last)
+
+    def _embeddings_error(self, exc):
+        return self._json(exc.status, {
+            "error": {
+                "message": exc.message,
+                "type": ("rate_limit_error" if exc.status == 429
+                         else "invalid_request_error" if exc.status < 500
+                         else "server_error"),
+                "code": exc.code,
+            }
+        })
+
+    def _pick_embedding_account(self, realm, model_id, excluded):
+        """Pick a text-pool account under the same guards as chat/audio."""
+        apply_daily_guards()
+        apply_reserve_credits()
+        hold = restriction_hold_remaining(realm)
+        if hold > 0:
+            raise wb_embeddings.EmbeddingError(
+                "restriction_hold",
+                "上游账号级限制生效中（整池暂停），%d 秒后再试" % (int(hold) + 1),
+                429)
+        allowed = self._key_allowed_accounts()
+        texts, _ = _ensure_pools()
+        if texts is None:
+            raise wb_embeddings.EmbeddingError(
+                "pool_unavailable", "account pool is not ready", 503)
+        pinned = pinned_account()
+        if pinned is not None:
+            try:
+                texts.require(pinned)
+            except wb_pool_scope.ScopeViolation as exc:
+                raise wb_embeddings.EmbeddingError("pool_boundary", str(exc), 403)
+            except wb_pool_text.PoolBoundaryBlocked as exc:
+                raise wb_embeddings.EmbeddingError("pool_boundary", str(exc), 503)
+            if allowed is not None and pinned.uid not in allowed:
+                raise wb_embeddings.EmbeddingError(
+                    "account_not_allowed",
+                    "the pinned account is not allowed by this API key",
+                    403)
+            if pinned.realm != realm:
+                raise wb_embeddings.EmbeddingError(
+                    "realm_mismatch",
+                    "the pinned account belongs to a different realm",
+                    409)
+            if not pinned.ready(model=model_id):
+                raise wb_embeddings.EmbeddingError(
+                    "account_unavailable",
+                    "the pinned account is unavailable: %s"
+                    % pinned.unavailable_reason(model=model_id),
+                    503)
+            return pinned
+        account = texts.pick(realm=realm, exclude=excluded, model=model_id,
+                             allowed=allowed)
+        if account is None:
+            raise wb_embeddings.EmbeddingError(
+                "no_usable_account",
+                "no usable account for embeddings; " + texts.empty_detail(realm)
+                + pool_unavailable_detail(realm, model_id, allowed),
+                503)
+        return account
+
     # ------------------------------------------------------------ 媒体（生图 / 生视频）
 
-    def _payload_or_error_for_media(self):
+    def _payload_or_error_for_media(self, path="", extra_min_bytes=None):
         """媒体路由的体上限：**不小于** 24 MB，也不小于用户配置的通用上限。
 
         只放宽不收紧：改图的输入图是 data URL，8 MB 原图编码后约 10.7 MB，而通用
         上限默认 16 MB、还可能被 `max_payload_mb` 调小——那是给 chat 定的尺子。
+        `/v1/images/edits` 同时兼容 OpenAI 标准 `multipart/form-data` 与 JSON。
+
+        去水印传 `extra_min_bytes`：它的入参是整张图的 base64，32 MB 的图编码后
+        约 43 MB，比改图还大一圈。抬上限而不是拦小图，因为这道闸的本意是防误发
+        巨型载荷，不是给合法的后处理加一道尺寸税。
         """
         configured = wb_settings.max_payload_mb(ACCOUNTS_DIR)
         generic = configured * 1024 * 1024 if configured is not None else MAX_PAYLOAD_BYTES
-        limit = max(generic, MEDIA_MAX_PAYLOAD_BYTES)
+        limit = max(generic, MEDIA_MAX_PAYLOAD_BYTES, extra_min_bytes or 0)
+        content_type = self.headers.get("Content-Type") or ""
+        if path in ("/v1/images/edits", "/images/edits") and "multipart/form-data" in content_type.lower():
+            try:
+                raw = self._read_raw_body(limit)
+            except BodyTooLarge as exc:
+                self._reject_body_after_reply = True
+                self._error(413, "payload too large (%d bytes > %d limit)" % (exc.length, limit),
+                            "invalid_request_error")
+                self._drain_rejected_body(exc.length)
+                self.close_connection = True
+                return None
+            except BadJSON:
+                self._error(400, "invalid multipart body", "invalid_request_error")
+                return None
+            try:
+                return wb_media.parse_edit_multipart(raw, content_type)
+            except wb_media.MediaError as exc:
+                self._media_error(exc)
+                return None
         try:
             return self._read_payload(max_bytes=limit, allow_list=False)
         except BodyTooLarge as exc:
@@ -25682,6 +26766,7 @@ class Handler(BaseHTTPRequestHandler):
         models = self._media_catalog(realm)
         tag = (wb_media.TAG_IMAGE_TO_IMAGE if kind == "edit"
                else wb_media.TAG_TEXT_TO_IMAGE)
+        models = self._media_models_allowed(models)
         model = wb_media.pick_model(models, payload.get("model"), tag)
         size = wb_media.check_size(payload.get("size"))
         count = payload.get("n")
@@ -25720,6 +26805,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _media_catalog(self, realm):
         """该区的媒体模型清单：内存 → 留档副本 → 现拉一次。"""
+        allowed = self._key_allowed_accounts()
         payload = _catalog_raw.get(realm)
         if payload is None:
             payload = read_catalog_dump(realm)
@@ -25727,7 +26813,8 @@ class Handler(BaseHTTPRequestHandler):
                 _catalog_raw[realm] = payload
         if payload is None:
             texts, medias = _ensure_pools()
-            account = (medias.pick(realm=realm) if medias is not None
+            account = (medias.pick(realm=realm, allowed=allowed)
+                       if medias is not None
                        else representative_account(
                            realm=realm, scope=wb_pool_scope.SCOPE_MEDIA))
             if account is None:
@@ -25745,6 +26832,18 @@ class Handler(BaseHTTPRequestHandler):
                 "NO_MEDIA_MODEL",
                 "该区目录里没有任何媒体模型（该账号可能没有生图权限）")
         return models
+
+    def _media_models_allowed(self, models):
+        """Hide media models this API key is not allowed to call."""
+        allowed = []
+        for model in models:
+            if not self._key_model_error(model.get("id")):
+                allowed.append(model)
+        if not allowed:
+            raise wb_media.MediaError(
+                "NO_MEDIA_MODEL",
+                "当前 API Key 的模型白名单不包含任何该出口的媒体模型")
+        return allowed
 
     def _pick_media_account(self, realm, model_id, cost_hint, excluded):
         """挑一个账号跑这次媒体请求：四道闸门全过才派发。
@@ -25863,15 +26962,15 @@ class Handler(BaseHTTPRequestHandler):
         if not allowed_now:
             return self._rate_limited(MediaRateLimited(wait))
 
-        if not acquire_media_slot():
-            return self._error(
-                503, "media slots busy (%d in flight); retry shortly" % MEDIA_SLOTS,
-                "server_error")
         cost_hint = media_image_cost_hint(prepared["model"]["id"])
         spend_ok, spend_why = media_key_spend_allow(
             self._key_id(), cost_hint, int(config.get("daily_credits_per_key") or 0))
         if not spend_ok:
             return self._media_error(wb_media.MediaError("NO_CREDIT", spend_why))
+        if not acquire_media_slot():
+            return self._error(
+                503, "media slots busy (%d in flight); retry shortly" % MEDIA_SLOTS,
+                "server_error")
         excluded = set()
         tried = 0
         try:
@@ -25976,7 +27075,8 @@ class Handler(BaseHTTPRequestHandler):
                                or ref_images)
             tag = (wb_media.TAG_IMAGE_TO_VIDEO if wants_image
                    else wb_media.TAG_TEXT_TO_VIDEO)
-            model = wb_media.pick_model(models, payload.get("model"), tag)
+            model = wb_media.pick_model(
+                self._media_models_allowed(models), payload.get("model"), tag)
             # **先只校验、不下载**：数量上限与首尾帧互斥只用字段本身就能判断。
             # 放在下载之前有两层理由——拒得早（客户端改一行参数就能重试），
             # 也免得别人拿十个坏地址让我们白下载一轮。
@@ -26043,12 +27143,15 @@ class Handler(BaseHTTPRequestHandler):
             # 在这里换成"先上传拿 download_url"。放在建 body 之后、排队之前，
             # 是为了让**排队路径**存进任务表的也是已经可抓的地址——否则排到半夜
             # 才提交时上游照样 2013，而且那时候调用方早已拿到 202、以为成了。
-            body = resolve_reference_uploads(body, realm, model["id"])
+            body = resolve_reference_uploads(
+                body, realm, model["id"],
+                allowed=self._key_allowed_accounts())
             cost_hint = media_cost_hint(
                 model["id"], params["seconds"], params.get("resolution"),
                 with_reference=bool(body.get("reference_images")
                                     or body.get("reference_videos")
-                                    or body.get("reference_audios")))
+                                    or body.get("reference_audios")),
+                audio=params.get("enable_audio") is not False)
         except wb_media.MediaError as exc:
             return self._media_error(exc)
 
@@ -26273,6 +27376,7 @@ class Handler(BaseHTTPRequestHandler):
         tag = (query.get("tag") or [None])[0]
         try:
             models = self._media_catalog(realm)
+            models = self._media_models_allowed(models)
         except wb_media.MediaError as exc:
             return self._media_error(exc)
         if tag:
@@ -26317,6 +27421,20 @@ class Handler(BaseHTTPRequestHandler):
                     per_resolution[name] = price
             if per_resolution:
                 model["creditsPerSecond"] = per_resolution
+            # 关掉声音是另一个价（2026-11-04 实测 kling-video-v3 720P 3 秒：
+            # 有声 32.37 = 10.79/秒，静音 21.58 = 7.1933/秒，正好 2/3）。不单列
+            # 出来，调用方会以为 `enable_audio:false` 也照收原价。
+            per_resolution_muted = {}
+            for name in (generation.get("resolutions")
+                         or [generation.get("defaultResolution")]):
+                if not name:
+                    continue
+                price = media_price_per_second(model.get("id"), name,
+                                               exact_only=True, audio=False)
+                if price is not None:
+                    per_resolution_muted[name] = price
+            if per_resolution_muted:
+                model["creditsPerSecondMuted"] = per_resolution_muted
             if model["creditPerSecond"] is None:
                 # 如实说明现在的估算依据是上界，而不是装作知道价格。
                 model["creditPerSecondCeiling"] = wb_media.COST_VIDEO_PER_SECOND_CEILING
@@ -26443,6 +27561,13 @@ class Handler(BaseHTTPRequestHandler):
                     daily_token_limit = max(0, int(daily_token_limit or 0))
                 except (TypeError, ValueError):
                     daily_token_limit = 0
+                # 累计积分额度（积分，允许小数）。与上面同一规则：请求体没带就
+                # 沿用已存值，老面板保存不会把用户的额度清成 0（不限）。
+                if "credit_limit" in item:
+                    credit_limit = item.get("credit_limit")
+                else:
+                    credit_limit = stored.get("credit_limit")
+                credit_limit = wb_settings.clean_credit_limit(credit_limit)
                 created_at = item.get("created_at") or (stored.get("created_at") if entry_id in existing else None) or wb_time.strftime("%Y/%m/%d %H:%M")
                 cleaned.append({
                     "id": entry_id,
@@ -26453,6 +27578,7 @@ class Handler(BaseHTTPRequestHandler):
                     "accounts": accounts,
                     "concurrency_limit": concurrency_limit,
                     "daily_token_limit": daily_token_limit,
+                    "credit_limit": credit_limit,
                     "enabled": enabled,
                     "created_at": created_at,
                 })
@@ -26701,6 +27827,34 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_unified_models_enabled(ACCOUNTS_DIR, raw)
             reply["unified_models_enabled"] = raw
+        if "claude_aliases" in payload:
+            try:
+                cleaned = wb_settings.set_claude_aliases(
+                    ACCOUNTS_DIR, payload.get("claude_aliases"))
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            reply["claude_aliases"] = cleaned
+        if "claude_aliases_enabled" in payload:
+            raw = payload.get("claude_aliases_enabled")
+            if not isinstance(raw, bool):
+                return self._error(400, "claude_aliases_enabled must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_claude_aliases_enabled(ACCOUNTS_DIR, raw)
+            reply["claude_aliases_enabled"] = raw
+        if "effort_aliases" in payload:
+            try:
+                cleaned = wb_settings.set_effort_aliases(
+                    ACCOUNTS_DIR, payload.get("effort_aliases"))
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            reply["effort_aliases"] = cleaned
+        if "effort_aliases_enabled" in payload:
+            raw = payload.get("effort_aliases_enabled")
+            if not isinstance(raw, bool):
+                return self._error(400, "effort_aliases_enabled must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_effort_aliases_enabled(ACCOUNTS_DIR, raw)
+            reply["effort_aliases_enabled"] = raw
         if "filter_models_by_key" in payload:
             raw = payload.get("filter_models_by_key")
             if not isinstance(raw, bool):
@@ -27186,6 +28340,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, str(exc), "invalid_request_error")
             wb_settings.set_media_config(ACCOUNTS_DIR, patch)
             reply["media"] = wb_settings.media_config(ACCOUNTS_DIR)
+        if "watermark" in payload:
+            # 与 media 同一个道理：白名单外的键会被静默忽略，前端回「保存成功」
+            # 而什么都没落盘。去水印默认关，这个入口就是它唯一的开法。
+            raw = payload.get("watermark")
+            if not isinstance(raw, dict):
+                return self._error(400, "watermark must be an object",
+                                   "invalid_request_error")
+            try:
+                patch = wb_settings.validate_watermark_patch(raw)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            wb_settings.set_watermark_config(ACCOUNTS_DIR, patch)
+            reply["watermark"] = wb_settings.watermark_config(ACCOUNTS_DIR)
+        if "embeddings" in payload:
+            raw = payload.get("embeddings")
+            if not isinstance(raw, dict):
+                return self._error(400, "embeddings must be an object",
+                                   "invalid_request_error")
+            try:
+                patch = wb_settings.validate_embeddings_patch(raw)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            wb_settings.set_embeddings_config(ACCOUNTS_DIR, patch)
+            reply["embeddings"] = wb_settings.embeddings_config(ACCOUNTS_DIR)
         if "codearts" in payload:
             raw = payload.get("codearts")
             if not isinstance(raw, dict):
@@ -29200,6 +30378,8 @@ class Handler(BaseHTTPRequestHandler):
         all_tools.extend(additional_tools_from_input(payload))
         custom_names = custom_tool_names(all_tools)
         chat_req = responses_to_chat(payload, compaction=compaction)
+        if req_realm != 'codearts':
+            _normalize_client_effort(self, chat_req)
         ns_map = chat_req.pop("_namespace_map", None)
         # Echo these back on the response object; see chat_to_response.
         request_meta = {
@@ -29591,6 +30771,8 @@ class Handler(BaseHTTPRequestHandler):
             chat_req = messages_to_chat(payload)
         except ValueError as exc:
             return self._anthropic_error(400, str(exc), "invalid_request_error")
+        if req_realm != 'codearts':
+            _normalize_client_effort(self, chat_req)
         model = chat_req.get("model") or "unknown"
         want_stream = bool(chat_req.get("stream"))
         session_key = extract_session_key(self.headers, chat_req)
@@ -29805,6 +30987,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._apply_pinned_route():
             return
         path = self.path.split("?")[0]
+        if path in ("/settings/data-backup/import", "/settings/data-backup/confirm",
+                    "/settings/data-backup/cancel"):
+            return self._data_backup(path.rsplit("/", 1)[1])
         if path == "/v1/accounts/authorize":
             started = time.time()
             if not self._external_authorized("account:auth"):
@@ -29992,6 +31177,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
+        if path == MCP_PATH:
+            # MCP 端点自己读 body：它的错误必须是 JSON-RPC 的 -32700 / -32600，
+            # 而不是网关惯用的 `{"error": ...}` 信封——客户端按协议解析，给它
+            # OpenAI 形状等于没回。所以在这里就分流，不进下面那套 payload 逻辑。
+            if not self._authorized():
+                return
+            return self._handle_mcp()
         # 生视频的取消：路径里带 task id，进不了 MEDIA_POST_PATHS 的精确匹配。
         if path.startswith("/v1/videos/") and path.endswith("/cancel"):
             if not self._authorized():
@@ -30021,11 +31213,18 @@ class Handler(BaseHTTPRequestHandler):
         # 会连"开关关着就 404"都走不到——直接被这里判成 not found。
         is_media_route = path in MEDIA_POST_PATHS
         is_audio_route = path in AUDIO_POST_PATHS
-        if not is_account_route and not is_messages_route and not is_media_route and not is_audio_route and path not in (
+        # 去水印与嵌入同理：各自有独立开关，开关关着要能回 403（"功能在，没开"），
+        # 所以必须先放行到各自的处理函数，而不是在这里统一判 404。
+        is_watermark_route = path in WATERMARK_POST_PATHS
+        is_embeddings_route = path in EMBEDDINGS_POST_PATHS
+        if (not is_account_route and not is_messages_route
+                and not is_media_route and not is_audio_route
+                and not is_watermark_route and not is_embeddings_route
+                and path not in (
                     "/v1/chat/completions", "/chat/completions",
                     "/v1/completions", "/completions",
                     "/v1/responses", "/responses",
-                    "/v1/responses/compact", "/responses/compact"):
+                    "/v1/responses/compact", "/responses/compact")):
             return self._error(404, "not found", "invalid_request_error")
         if is_messages_route:
             if not self._key_ok():
@@ -30066,11 +31265,31 @@ class Handler(BaseHTTPRequestHandler):
         elif is_media_route:
             # 改图的输入图是 data URL，8 MB 原图编码后约 10.7 MB；通用上限
             # （默认 16 MB，还可能被 max_payload_mb 调小）会把一次合法请求判成 413。
-            payload = self._payload_or_error_for_media()
+            payload = self._payload_or_error_for_media(path)
+        elif is_watermark_route:
+            # 整图 base64 比改图还大，另给一个更宽的上限。
+            payload = self._payload_or_error_for_media(
+                extra_min_bytes=WATERMARK_MAX_PAYLOAD_BYTES)
         else:
             payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
         if payload is None:
             return
+        if not is_account_route:
+            # 每 Key 累计积分额度（0/缺省 = 不限）。同样放在并发槽位之前：
+            # 已经烧完的 Key 不该先排队等 WB_CHAT_SLOT_WAIT 秒再被拒。
+            # 已用积分由 wb_keyquota 从 usage.jsonl 增量合计。
+            _credit_hit, _credit_used, _credit_limit = key_credit_exhausted(
+                self.key_entry, self._key_id())
+            if _credit_hit:
+                key_name = (self.key_entry or {}).get("name") or self._key_id() or "当前 Key"
+                message = ("Credit quota exhausted for API key '%s' (%.2f of %g credits used); "
+                           "raise the limit for this key in the panel to continue"
+                           % (key_name, _credit_used, _credit_limit))
+                record_error(payload.get("model") or "unknown", 403, message,
+                             stream=payload.get("stream"), key=self._key_id())
+                if is_messages_route:
+                    return self._anthropic_error(403, message, "permission_error")
+                return self._error(403, message, "permission_error")
         if not is_account_route and not is_media_route and not is_audio_route:
             if self._maybe_web_model(payload, is_messages_route):
                 return
@@ -30078,6 +31297,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_accounts(path, payload)
         if is_audio_route:
             return self._handle_audio_post(path, payload)
+        # 去水印与嵌入都在模型别名之前分流：它们的 `model` 字段是上游真实 id
+        # （嵌入是 bge-m3），套 chat 的别名表只会把它改成一个 chat 模型名。
+        if is_watermark_route:
+            return self._handle_watermark_post(payload)
+        if is_embeddings_route:
+            return self._handle_embeddings_post(payload)
         if is_media_route:
             return self._handle_media_post(path, payload)
         # Operator aliases and unified names are client-facing. Remember the
@@ -30087,12 +31312,16 @@ class Handler(BaseHTTPRequestHandler):
             self._client_model = str(payload.get("model") or "")
         except Exception:
             self._client_model = ""
+        self._claude_alias = ""
         try:
             aliases = wb_settings.effective_model_aliases(ACCOUNTS_DIR)
         except Exception:
             aliases = {}
         _apply_model_aliases(payload, aliases)
         _apply_background_model_alias(payload)
+        # Claude Desktop 只能填 claude-* 形式的模型 ID，上游一个都不认：先按前缀
+        # 表解析成真实 id（回程仍回显真实 id）。推理档位在路由解析最终模型后归一化。
+        _apply_claude_model_alias(self, payload)
         # 日 token 限量（单位 M，0/缺省 = 不限）。放在并发槽位之前判断：
         # 已经被限的 key 不该先排队等 WB_CHAT_SLOT_WAIT 秒再被拒。
         # 用量来自 _daily_usage 的 keytokens 视图（默认 15s 缓存）。
@@ -30185,7 +31414,6 @@ class Handler(BaseHTTPRequestHandler):
         # Only the knobs that change behaviour are logged - never message text.
         session_key = extract_session_key(self.headers, payload)
         want_stream = bool(payload.get("stream"))
-        model = payload.get("model") or "hy4-preview"
         t_start = time.time()
         explicit_realm = self._request_realm()
         req_realm = explicit_realm or CURRENT_REALM
@@ -30194,6 +31422,7 @@ class Handler(BaseHTTPRequestHandler):
         # key/banned/disabled check, so a model closed on another exit cannot
         # leak here. _client_model still holds the original for key checks.
         resolve_unified_model_in_payload(payload, req_realm)
+        model = payload.get("model") or "hy4-preview"
         if req_realm == "codearts":
             blocked = self._banned_model_error(payload.get("model")) or self._key_model_error(payload.get("model"))
             if blocked:
@@ -30201,6 +31430,7 @@ class Handler(BaseHTTPRequestHandler):
             # CodeArts 不走 WorkBuddy 的 build_upstream_body / 账号池：请求体、
             # 超时、错误映射都由 wb_codearts 负责，回程复用下面的处理器。
             return self._handle_codearts_chat(payload, session_key, req_realm)
+        _normalize_client_effort(self, payload)
         forwarded = build_upstream_body(payload)
         given = client_effort_of(payload) or payload.get("reasoning") \
             or payload.get("thinking") or payload.get("enable_thinking")
@@ -30916,6 +32146,11 @@ def _bootstrap_runtime(args):
     SYSTEM_PROMPT = args.system_prompt
     if args.accounts_dir:
         ACCOUNTS_DIR = os.path.abspath(args.accounts_dir)
+    restore_phase = wb_data_backup.apply_pending(wb_data_backup.roots(ACCOUNTS_DIR, USAGE_DIR))
+    if restore_phase == "restored":
+        log("data backup restore applied", tag="settings")
+    elif restore_phase == "failed":
+        log("data backup restore failed; original data retained", level="WARN", tag="settings")
     # 日志落库（默认关闭）：在账号池之前初始化，好让「池加载失败」这类最需要
     # 事后留档的启动日志也能进库。关闭时这里只造一个 enabled=False 的空壳，
     # 不建文件、不改日志路径。

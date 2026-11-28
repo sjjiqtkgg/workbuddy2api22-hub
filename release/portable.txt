@@ -23,6 +23,7 @@
 LICENSE
 README.md
 docs/CHANGELOG.md
+docs/CLAUDE-DIRECT-AND-EFFORT.md
 docs/OUTBOUND-HEADER-AUDIT.md
 docs/TROUBLESHOOTING-11-128.md
 dashboard.html
@@ -60,19 +61,24 @@ tools/wb-tls-bridge/licenses/x-crypto.txt
 tools/wb-tls-bridge/licenses/x-sys.txt
 
 wb_accounts.py
+wb_data_backup.py
 wb_activity.py
 wb_agents.py
 wb_atrest.py
 wb_audio.py
 wb_catalog.py
+wb_client_aliases.py
 wb_codearts.py
 wb_codearts_crypto.py
 wb_egress.py
+wb_embeddings.py
 wb_external_api.py
 wb_fingerprint.py
 wb_identity.py
 wb_ipintel.py
+wb_keyquota.py
 wb_logstore.py
+wb_mcp.py
 wb_media.py
 wb_media_client.py
 wb_media_tasks.py
@@ -98,6 +104,7 @@ wb_update_external.py
 wb_update_portable.py
 wb_update_request.py
 wb_upstream_pool.py
+wb_watermark.py
 wb_webagent.py
 wb_webprompts.py
 wb_webtools.py

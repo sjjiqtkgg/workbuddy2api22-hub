@@ -21,8 +21,10 @@ const script = dashboardScript();
 
 /* ---- 1. 结构：账号表有「权重」列，改动走 /accounts/set -------------- */
 
-assert.ok(/<th style="text-align:center;width:58px">权重<\/th>/.test(html),
-  '账号表应有 58px 宽的「权重」表头（够放自绘下拉的值 + 箭头，且不留空白）');
+assert.ok(/<th style="text-align:center">权重<\/th>/.test(html),
+  '账号表应有「权重」表头，列宽由 colgroup 的宽屏比例统一分配');
+assert.ok(/@media \(min-width:1280px\)[\s\S]*?col\.acct-col-weight\{width:8%\}/.test(html),
+  '权重列应参与「状态 → 缓存」的宽屏比例分配');
 /* 回归：64px 的列减去 td 内边距只剩 40px，通用触发器的 padding/gap/箭头
    吃掉 37px，权重数字被挤成 1px（界面上只剩一个箭头）。这里钉住该列的
    紧凑触发器与放宽后的列宽。 */

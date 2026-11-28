@@ -360,6 +360,34 @@ class AggregateMatchesPerRowCostingTests(AggregateHarness):
                 self.assertEqual(models[model]["window"][field], expected[field],
                                  (model, field))
 
+    def test_model_credit_conversion_pairs_only_charged_text_samples_in_range(self):
+        paid = _row(T0 + 710, MODEL_A, ACCT_A, 4_970_000, 220_000, credit=22.74)
+        old_paid = _row(T0 + 10, MODEL_A, ACCT_A, 80, 20, credit=1.5)
+        paid_without_total = dict(_row(T0 + 720, MODEL_B, ACCT_A, 300, 100, credit=2),
+                                  total_tokens=0)
+        free = _row(T0 + 730, MODEL_A, ACCT_A, 1_000_000, 10)
+        missing_credit = _row(T0 + 740, MODEL_A, ACCT_A, 500, 10)
+        missing_credit.pop("credit")
+        failed = dict(_row(T0 + 750, MODEL_A, ACCT_A, 100, 10, credit=1), outcome="failed")
+        media = dict(_row(T0 + 760, MODEL_A, ACCT_A, 100, 10, credit=40), kind="video")
+        paid_without_tokens = _row(T0 + 770, MODEL_A, ACCT_A, 0, 0, credit=3)
+        with open(self.log_path, "w", encoding="utf-8") as fh:
+            for row in (old_paid, paid, paid_without_total, free, missing_credit,
+                        failed, media, paid_without_tokens):
+                fh.write(json.dumps(row) + "\n")
+
+        result = P._compute_usage_analytics_uncached(since=T0 + 700, until=T0 + 800)
+        models = {entry["model"]: entry for entry in result["models"]}
+
+        def sample(model, half):
+            stat = models[model][half]
+            return tuple(stat[field] for field in P._MODEL_CREDIT_SAMPLE_FIELDS)
+
+        self.assertEqual(sample(MODEL_A, "window"), (5_190_000, 22.74, 1))
+        self.assertEqual(sample(MODEL_A, "all_time"), (5_190_100, 24.24, 2))
+        self.assertEqual(sample(MODEL_B, "window"), (400, 2, 1))
+        self.assertGreater(models[MODEL_A]["window"]["credit"], 22.74)
+
     def test_the_model_distribution_keeps_the_successful_only_rule(self):
         # 模型分布（账号行的 window_models / all_models）只统计成功请求：失败的
         # 调用记成需求会误导。_bump_model_row 重构后这条规则必须原样。

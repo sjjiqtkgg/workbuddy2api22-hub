@@ -389,7 +389,9 @@ class RuntimeTrimTests(unittest.TestCase):
         # Python on Linux can load it as an extension, so it is not always in
         # the CI host's sys.builtin_module_names.
         # fcntl is the POSIX lock backend and is never imported on Windows.
-        platform_modules = ("msvcrt", "nt", "winreg", "math", "fcntl", "zlib")
+        # binascii is built into python312.dll in the pinned Windows runtime,
+        # but Linux exposes it as an extension module without Lib/binascii.py.
+        platform_modules = ("msvcrt", "nt", "winreg", "math", "fcntl", "zlib", "binascii")
         needed = sorted(m for m in imported
                         if m not in local and m not in sys.builtin_module_names and m not in platform_modules)
         self.assertTrue(needed)

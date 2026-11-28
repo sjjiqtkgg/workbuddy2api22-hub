@@ -122,6 +122,7 @@ try {
     return {
       updateUI: updateUI,
       switchViewRealm: switchViewRealm,
+      setActiveGatewayRealm: setActiveGatewayRealm,
       toggleActiveGatewayRealm: toggleActiveGatewayRealm,
       applyAccountsTabLayout: applyAccountsTabLayout,
       view: () => window.VIEW_REALM,
@@ -211,6 +212,16 @@ const indexIn = (parent, el) => parent.children.indexOf(el);
   await api.switchViewRealm('cn');
   assert.equal(api.active(), 'intl', '在账号页切视图不得改网关默认出口');
   assert.equal(POSTS.length, 0, '切视图不该发任何写请求');
+
+  // The global menu changes the gateway exit and keeps the independent view.
+  POSTS = [];
+  await api.setActiveGatewayRealm('cn');
+  assert.equal(api.active(), 'cn', '顶栏出口控件应更新网关默认出口');
+  assert.equal(POSTS.filter(req => req.url.startsWith('/realm')).length, 1);
+  assert.equal(api.view(), 'cn', '切出口应保留当前查看版本');
+  await api.setActiveGatewayRealm('intl');
+  assert.equal(api.active(), 'intl');
+  assert.equal(api.view(), 'cn', '当前视图和网关默认出口可以不同');
 
   console.log('accounts realm switch assertions passed');
 })().catch(error => { console.log = realLog; console.error(error); process.exit(1); });

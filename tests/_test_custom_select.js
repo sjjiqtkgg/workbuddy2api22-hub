@@ -247,6 +247,14 @@ ok('每次打开重置查询并聚焦搜索框', () => {
   assert.ok(fn.includes('input.focus()'), 'openWrap_ should focus the search box');
   assert.ok(fn.includes("querySelectorAll('.cs-opt')"),
     'openWrap_ must scroll the selected ROW, not children[selectedIndex] (search box shifted it)');
+  assert.ok(!/\.scrollIntoView\b/.test(fn),
+    'openWrap_ must adjust panel.scrollTop directly without scrollIntoView jumping outer window scroll');
+  const reveal = html.slice(html.indexOf('@keyframes nextSettingsReveal'),
+                            html.indexOf('/* === NEXT-UI REFACTOR V2 END === */'));
+  assert.ok(!/transform\s*:/.test(reveal),
+    'nextSettingsReveal must stay opacity-only so fixed .cs-panel is never trapped under .next-settings-shell');
+  assert.ok(!/nextSettingsReveal[^;]*\bboth\b/.test(reveal),
+    'nextSettingsReveal must not keep fill-mode both');
 });
 
 /* 行为：直接跑过滤函数，确认隐藏 / 空态 / 大小写都按契约来。 */

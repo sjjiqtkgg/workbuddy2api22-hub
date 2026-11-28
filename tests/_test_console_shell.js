@@ -3,7 +3,7 @@
  * 这一轮把界面从「顶部页签」改成「左侧分组菜单」，动的是导航的呈现层，
  * 所以这里钉住三件事：
  *
- *   1. 骨架：左侧菜单里的既有按钮保持原顺序，并包含新增的 API 接入入口；
+ *   1. 骨架：左侧菜单里的既有按钮保持原顺序，并包含一级「接入」入口；
  *      书签与首屏选页的那份清单也必须同步；「模型管理 / 请求记录」
  *      是内容入口，不是新页面，所以不进入页面清单，也改不了 ?tab=。
  *   2. 筛选：账号、模型、最近请求三处筛选只改显示，不改批量操作的原始范围；
@@ -27,14 +27,14 @@ function check(ok, label, extra) {
   checks += 1;
 }
 
-/* ---- 1. 结构：导航被搬进左侧菜单，既有入口保持顺序并新增 API 接入 -------- */
+/* ---- 1. 结构：导航被搬进左侧菜单，既有入口保持顺序并新增「接入」 -------- */
 
 check(/class="console-sidebar" id="consoleSidebar"/.test(html),
   '缺少左侧控制台菜单容器 #consoleSidebar');
 check(/class="console-shell"/.test(html), '缺少控制台外层 .console-shell');
 check(/class="console-contextbar"/.test(html), '缺少内容区上下文条 .console-contextbar');
 
-// 主菜单按钮：既有 id 与页面指向保持不变，API 接入作为独立入口加入。
+// 主菜单按钮：既有 id 与页面指向保持不变，接入作为独立入口加入。
 const NAV = [
   ['btnNavGateway', 'gateway', 'switchMainTab(\'gateway\')'],
   ['btnNavAccounts', 'accounts', 'switchMainTab(\'accounts\')'],
@@ -48,7 +48,7 @@ check(JSON.stringify(navButtons) === JSON.stringify(EXPECTED),
   '左侧菜单主导航顺序或入口不符合预期，实得 ' + navButtons.join(','));
 
 // 每个按钮仍指向原来的页面。
-['gateway', 'accounts', 'tasks', 'media', 'analytics', 'agents', 'api', 'settings', 'logs'].forEach(key => {
+  ['gateway', 'accounts', 'tasks', 'media', 'analytics', 'agents', 'api', 'settings', 'logs'].forEach(key => {
   const id = 'btnNav' + key.charAt(0).toUpperCase() + key.slice(1);
   check(new RegExp('id="' + id + '"[^>]*onclick="switchMainTab\\(\'' + key + '\'\\)"').test(html),
     id + ' 应当仍然切到 ' + key + ' 页');
@@ -96,9 +96,9 @@ check(headTabs && mainTabs && JSON.stringify(names(headTabs[1])) === JSON.string
 check(names(mainTabs[1]).length === 10 && names(mainTabs[1]).includes('overview') &&
       names(mainTabs[1]).includes('media') && names(mainTabs[1]).includes('api') &&
       !names(mainTabs[1]).includes('models'),
-  '主页面清单包含总览、媒体页、API 接入且不含内容入口');
+  '主页面清单包含总览、媒体页、接入且不含内容入口');
 check(JSON.stringify(names(mainTabs[1])) === JSON.stringify([
-  'overview', 'gateway', 'accounts', 'api', 'analytics', 'tasks', 'agents', 'media', 'settings', 'logs'
+  'overview', 'accounts', 'api', 'gateway', 'analytics', 'tasks', 'agents', 'media', 'settings', 'logs'
 ]), '主页面清单顺序应与工作台菜单一致');
 
 // 侧栏折叠与手机抽屉的入口都在。
@@ -256,6 +256,8 @@ for(const [group, stateId] of [['model', 'setModelAliasesEnabledState'], ['api',
   check(section && section.split('>')[0].includes('data-settings-group="' + group + '"'),
     '设置项 ' + stateId + ' 应通过明确的属性归到 ' + group);
 }
+check(settingsPage.indexOf('id="keyList"') < 0 && settingsPage.indexOf('id="apiKeyExamples"') < 0,
+  '模型调用 Key 不应继续留在设置页');
 
 // ---- 3. 概览：用已有数据，不发新请求，也不冒充时间序列 ---------------
 

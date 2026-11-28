@@ -20,7 +20,7 @@
 This project is for protocol research and personal use only. Prefer the official client, do not use your primary account, and do not resell or share access.
 
 <p align="center">
-  <a href="https://github.com/niyouqianma/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v2.2.5-2496ED?style=flat-square" alt="Version 2.2.5"></a>
+  <a href="https://github.com/niyouqianma/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v2.2.8-2496ED?style=flat-square" alt="Version 2.2.8"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -36,10 +36,6 @@ This project is for protocol research and personal use only. Prefer the official
 - **自动化福利与签到**：内置国内版成长任务、星巴克 / 记者节运营活动、小程序任务、加油站签到与猫猫旅行，支持国际版每日活跃会话与 CodeArts 自动签到；手机 App 对话、公众号关注与公益捐赠等必须真实完成的任务只提示、不伪造。
 - **可视化管理看板**：提供 Web 仪表盘，支持实时请求日志、Token/积分透视、多 API Key 权限分发（模型/账号白名单）与额度护栏。
 - **一键工作台启动**：`start-workbuddy-all.bat` 先用 `--probe-only` 检查端口上的实例是否健康，未运行才拉起网关并打开 WorkBuddy 工作台，避免重复启动或误连陌生服务。
-
-### 社区 Rust 版本
-
-[YTjungle666/workbuddy2api-hub](https://github.com/YTjungle666/workbuddy2api-hub) 是社区独立维护的 Rust 重写分支。网关后端与启动器均使用 Rust 实现，提供单文件静态二进制，不依赖 Python 运行时；功能以上游 `v2.0.1` 为对齐基线。它不是本仓库的官方发布物，问题反馈与版本更新请前往对应仓库。
 
 > ⚡ **Vibe Coding 产物**：本项目为 100% Vibe Coding 协同产物——人类开发者提出架构与业务意图，AI 助手端到端完成逆向分析、链路调度、WAF 指纹脱敏与界面编写。
 
@@ -166,6 +162,12 @@ CodeArts 的模型 ID 按上游目录**精确匹配**：`deepseek-v4.1-flash` �
 
 ---
 
+### 数据备份与恢复
+
+在「设置 → 系统与维护 → 数据备份与恢复」可下载全量 ZIP，包含账号、设置、完整用量流水（含归档段）和已配置的订阅桥数据。备份里的账号凭证与 API Key 应私下保管。
+
+导入 ZIP 后先校验，再点「安排恢复」。下一次重启网关时替换对应数据目录，恢复前的数据保留在各数据目录的 `.wb-data-backup/<备份 ID>/previous/`。如果备份里有面板密码，重启后使用备份中的密码登录。
+
 ## 二、账号接入与 API Key 权限
 
 ### 1. 账号添加与代理出口绑定
@@ -203,6 +205,18 @@ export ANTHROPIC_BASE_URL="http://127.0.0.1:8788"
 export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 ```
 
+**Claude 桌面版直连（`claude-*` 模型名）**
+
+Claude 桌面版的「第三方推理」只接受 `claude-*` 形式的模型 ID，网关按前缀把它映射到真实模型，回显的是真实 ID：
+
+| 客户端填 | 实际调用 |
+|---|---|
+| `claude-sonnet-5` | `deepseek-v4.1-flash` |
+| `claude-opus-4-1` | `deepseek-v4-pro` |
+| `claude-haiku-4-5-20251001` | `deepseek-v4.1-flash` |
+
+同一套入站钩子还把客户端自造的推理档位 `xhigh` / `ultra` 归一化成上游的 `max`（模型自己声明该档位时保持原样），日志里能看到 `effort_from=… effort_to=…`。映射表、开关、`thinking.budget_tokens` 的换算与验收命令见 **[docs/CLAUDE-DIRECT-AND-EFFORT.md](docs/CLAUDE-DIRECT-AND-EFFORT.md)**。
+
 ---
 
 ## 四、常用环境变量
@@ -216,6 +230,10 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 | `WB_USAGE_ROTATE_BYTES` | `8388608` | 用量日志的轮转阈值（字节，默认 8 MiB）。`0` 停止新轮转。备份和降级见 [用量目录说明](usage/README.txt) |
 | `WB_CHAT_SLOT_WAIT` | `30` | 并发槽位的等待秒数：全局对话槽位与 Key 级 `concurrency_limit` 共用这个预算，等到才有名额，超时仍按 429 拒绝 |
 | `WB_ENABLE_ANTHROPIC_MESSAGES` | `0` | 是否开启实验性 Anthropic Messages 协议转换 |
+| `WB_CLAUDE_ALIASES_ENABLED` / `WB_EFFORT_ALIASES_ENABLED` | `0` | 按需设为 `1` 开启 Claude 前缀映射 / 推理档位归一化 |
+| `WB_CLAUDE_ALIASES` | 内置表 | `claude-*` 前缀映射整表替换（`prefix=target` 或 JSON 对象），`off` 关闭。默认 `claude-opus*=deepseek-v4-pro`、`claude-sonnet*` / `claude-haiku*=deepseek-v4.1-flash` |
+| `CLAUDE_ALIAS_OPUS` / `CLAUDE_ALIAS_SONNET` / `CLAUDE_ALIAS_HAIKU` | 内置表 | 只覆盖某一族的映射目标，其余沿用默认 |
+| `WB_EFFORT_ALIASES` | `xhigh:max,ultra:max` | 推理档位别名表；客户端发来的档位模型不支持时改写成目标档位，`off` 关闭（逐字节透传） |
 | `WB_BACKGROUND_MODEL_TARGET` | 留空 | 后台模型别名改写目标（如 DSH 客户端自动映射） |
 | `WB_CA_BUNDLE` | 留空 | 自签根证书路径（供抓包调试或中间代理使用） |
 | `WB_CN_CHAT_UPSTREAM` | 官方默认 | 国内版出站代理地址 |
@@ -244,6 +262,9 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 | 生视频 | `POST` | `/v1/videos` | 异步生视频任务提交（本地并发排队与空闲调度） |
 | 视频状态 | `GET` | `/v1/videos/<id>` | 轮询视频生成进度与结果 |
 | 产物下载 | `GET` | `/v1/videos/<id>/content` | 下载视频 MP4 产物直链 |
+| 图片去水印 | `POST` | `/v1/images/strip-watermark` | 裁掉画面底部的水印留白（本地后处理，不扣积分；需在设置中启用） |
+| 文本嵌入 | `POST` | `/v1/embeddings` | OpenAI 兼容向量接口，上游模型 `bge-m3`（需在设置中启用） |
+| MCP 服务 | `POST` | `/mcp` | MCP 2025-06-18 无状态 JSON-RPC，把生图 / 生视频 / 去水印包成工具 |
 | 健康检查 | `GET` | `/health` | 网关运行状态、可用账号数与就绪模型分布 |
 | 创建账号授权请求 | `POST` | `/v1/accounts/authorize` | 按 `realm=cn` 或 `intl` 生成一次性浏览器授权链接 |
 | 查询授权状态 | `GET` | `/v1/accounts/authorize/<request_id>` | 查询浏览器登录结果；成功后账号自动写入账号列表 |
@@ -258,7 +279,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 316 个套件：238 个 Python + 78 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 324 个套件：245 个 Python + 79 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - `tests/_visual_recent.py` 是同一类手动检查器：用合成 fixture 起一份 1480 宽的「请求列表」，验证失败徽章点开的详情弹窗、四个过滤下拉真的把参数发到 `/usage/recent`，并把列表 / 弹窗 / 筛选条截图写到系统临时目录的 `wb-visual-recent/`。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
@@ -267,7 +288,7 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 
 ## 七、版本更新记录 (Changelog)
 
-本版更新请查看 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
+本版更新与完整历史版本请查阅 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
 
 ---
 

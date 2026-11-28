@@ -226,6 +226,10 @@ for(const name of legacy){
   assert.ok(!html.includes(name), 'dashboard.html 不该再残留设置页专用标识：' + name);
 }
 assert.ok(html.includes('initPageNav'), 'dashboard.html 应当有 initPageNav');
+assert.ok(
+  /<div id="pageAccounts" class="main-page page-nav-off">/.test(html),
+  '账号页应关闭重复的二级区块导航'
+);
 // 侧栏一律由 JS 现场插入，任何页面都不许在标记里写死
 assert.ok(!/class="page-sidebar"/.test(html), '侧栏不应写死在标记里');
 assert.ok(/\.main-page\.page-nav-on\s*>\s*\.page-sidebar/.test(html), '缺少页面级两栏样式');
@@ -362,6 +366,14 @@ api.pageNavSections(shrink)[1].remove();
 api.initPageNav(shrink);
 assert.strictEqual(shrink.querySelector('.page-sidebar'), null, '掉到一项要撤掉侧栏');
 assert.ok(!shrink.classList.contains('page-nav-on'), '掉到一项要取消两栏');
+
+/* 页面可以显式关闭区块导航；账号页就属于这种情况，页面内已有固定入口，
+   再生成一套「账号列表 / 当前禁用」只会重复占位。 */
+const navOff = attach(pageEl('pageNavOff', [sectionEl('账号列表'), sectionEl('当前禁用')]));
+navOff.classList.add('page-nav-off');
+api.initPageNav(navOff);
+assert.ok(!navOff.classList.contains('page-nav-on'), '显式关闭导航的页面不应启用两栏');
+assert.strictEqual(navOff.querySelector('.page-sidebar'), null, '显式关闭导航的页面不应生成侧栏');
 
 /* ---- 7. 滚动高亮：以「越过吸顶 header 的最后一个区块」为准 ---- */
 const spyPage = attach(pageEl('pageSpy', [sectionEl('甲'), sectionEl('乙')]));

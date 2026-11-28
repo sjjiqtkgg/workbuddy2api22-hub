@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Rotation preserves the logical ledger, its indexes, and existing counters."""
+import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +20,7 @@ with tempfile.TemporaryDirectory(prefix="usage-segments-import-") as startup:
         import wb_proxy as proxy
 
 import wb_usage_io as ledger
+import wb_data_backup as backup
 from wb_usage_board import UsageBoard
 
 
@@ -256,6 +260,134 @@ class LedgerTests(unittest.TestCase):
             self.assertNotEqual(changed["revision"], first["revision"])
             self.assertEqual(changed["rows"][0]["total_tokens"], 2)
             self.assertEqual(read.call_count, 2)
+
+
+class DataBackupTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.source = {group: root / "source" / group for group in backup.GROUPS}
+        self.target = {group: root / "target" / group for group in backup.GROUPS}
+        for path in (*self.source.values(), *self.target.values()):
+            path.mkdir(parents=True)
+
+    def archive(self):
+        stream = io.BytesIO()
+        backup.write_zip(self.source, stream)
+        return stream.getvalue()
+
+    def stage(self, payload):
+        return backup.stage(self.target, io.BytesIO(payload), len(payload))
+
+    def test_round_trip_includes_sealed_ledger_settings_bridge_and_wal(self):
+        accounts = self.source["accounts"]
+        usage = self.source["usage"]
+        (accounts / "settings.json").write_text('{"version":"fixture"}', encoding="utf-8")
+        (self.source["subbridge-data"] / "config.yaml").write_text("fixture", encoding="utf-8")
+        log = str(usage / "usage.jsonl")
+        ledger.append_line(log, '{"credit": 2}')
+        self.assertTrue(ledger.rotate(log, 1))
+        ledger.append_line(log, '{"credit": 3}')
+        ledger.maintain_archive(log, 1, threading.Event())
+        db = sqlite3.connect(usage / "logs.sqlite3")
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("CREATE TABLE demo (credit INTEGER)")
+            db.execute("INSERT INTO demo VALUES (8)")
+            db.commit()
+            payload = self.archive()
+        finally:
+            db.close()
+        (self.target["accounts"] / "old.json").write_text("old", encoding="utf-8")
+
+        state = self.stage(payload)
+        backup_id = state["id"]
+        self.assertEqual(state["phase"], "ready")
+        self.assertIsNone(backup.apply_pending(self.target))
+        self.assertTrue((self.target["accounts"] / "old.json").exists())
+        backup.choose(self.target, backup_id, True)
+        self.assertEqual(backup.apply_pending(self.target), "restored")
+        self.assertEqual(backup.status(self.target)["phase"], "restored")
+        self.assertEqual((self.target["usage"] / "usage.jsonl").read_bytes(),
+                         b'{"credit": 2}\n{"credit": 3}\n')
+        self.assertEqual((self.target["accounts"] / "settings.json").read_text(),
+                         '{"version":"fixture"}')
+        self.assertEqual((self.target["subbridge-data"] / "config.yaml").read_text(), "fixture")
+        self.assertFalse((self.target["accounts"] / "old.json").exists())
+        saved = self.target["accounts"] / backup.CONTROL / backup_id / "previous" / "old.json"
+        self.assertEqual(saved.read_text(), "old")
+        restored = sqlite3.connect(self.target["usage"] / "logs.sqlite3")
+        try:
+            self.assertEqual(restored.execute("SELECT credit FROM demo").fetchone(), (8,))
+        finally:
+            restored.close()
+
+    def test_unsafe_paths_and_file_kinds_are_rejected_before_staging(self):
+        link = zipfile.ZipInfo("accounts/link")
+        link.create_system = 3
+        link.external_attr = 0o120777 << 16
+        for names in (
+            ("accounts/../escaped",), ("accounts/C:/escaped",),
+            ("accounts/aux.txt",), ("accounts/Name/a", "accounts/name/b"),
+            ("accounts/.wb-data-backup/state.json",), (link,),
+        ):
+            with self.subTest(names=names):
+                stream = io.BytesIO()
+                with zipfile.ZipFile(stream, "w") as archive:
+                    archive.writestr("manifest.json", json.dumps(
+                        {"format": backup.FORMAT, "groups": ["accounts", "usage"]}))
+                    for name in names:
+                        archive.writestr(name, "fixture")
+                with self.assertRaises(backup.BackupError):
+                    self.stage(stream.getvalue())
+                self.assertEqual(backup.status(self.target)["phase"], "idle")
+
+    def test_failed_install_restores_all_original_data_and_can_cancel(self):
+        old_accounts = self.target["accounts"] / "old.json"
+        old_accounts.write_text("old", encoding="utf-8")
+        old_usage = self.target["usage"] / "usage.jsonl"
+        old_usage.write_text("old ledger", encoding="utf-8")
+        (self.source["accounts"] / "new.json").write_text("new", encoding="utf-8")
+        (self.source["usage"] / "usage.jsonl").write_text('{"credit": 4}\n', encoding="utf-8")
+        first = self.stage(self.archive())
+        backup.choose(self.target, first["id"], False)
+        self.assertEqual(backup.status(self.target)["phase"], "cancelled")
+        state = self.stage(self.archive())
+        backup.choose(self.target, state["id"], True)
+        replace = os.replace
+
+        def fail_install(source, destination):
+            if Path(destination) == old_usage and Path(source).parent.name == "staged":
+                raise OSError("injected restore failure")
+            return replace(source, destination)
+
+        with patch.object(backup.os, "replace", side_effect=fail_install):
+            self.assertEqual(backup.apply_pending(self.target), "failed")
+        self.assertEqual(old_accounts.read_text(), "old")
+        self.assertEqual(old_usage.read_text(), "old ledger")
+        self.assertFalse((self.target["accounts"] / "new.json").exists())
+
+    def test_next_start_rolls_back_an_interrupted_restore(self):
+        source = self.source["accounts"] / "settings.json"
+        target = self.target["accounts"] / "settings.json"
+        source.write_text("backup", encoding="utf-8")
+        target.write_text("live", encoding="utf-8")
+        state = self.stage(self.archive())
+        backup.choose(self.target, state["id"], True)
+        replace = os.replace
+
+        def interrupt_install(source, destination):
+            if Path(destination) == target and Path(source).parent.name == "staged":
+                raise KeyboardInterrupt
+            return replace(source, destination)
+
+        with patch.object(backup.os, "replace", side_effect=interrupt_install):
+            with self.assertRaises(KeyboardInterrupt):
+                backup.apply_pending(self.target)
+        self.assertEqual(backup.status(self.target)["phase"], "applying")
+        self.assertEqual(backup.apply_pending(self.target), "failed")
+        self.assertEqual(target.read_text(), "live")
 
 
 class BoardTests(unittest.TestCase):

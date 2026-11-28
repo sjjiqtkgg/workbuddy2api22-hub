@@ -223,6 +223,76 @@ class ParameterGateTests(unittest.TestCase):
                                    {"prompt": "x", "image": "file:///etc/passwd"})
         self.assertEqual(status, 400)
 
+    def _multipart_request(self, path, boundary, parts, key=API_KEY, timeout=5):
+        chunks = []
+        for headers, data in parts:
+            chunks.append(("--" + boundary + "\r\n").encode("ascii"))
+            for k, v in headers.items():
+                chunks.append(("%s: %s\r\n" % (k, v)).encode("utf-8"))
+            chunks.append(b"\r\n")
+            chunks.append(data)
+            chunks.append(b"\r\n")
+        chunks.append(("--" + boundary + "--\r\n").encode("ascii"))
+        raw = b"".join(chunks)
+        req = urllib.request.Request(_ON.base + path, data=raw, method="POST")
+        req.add_header("Content-Type", "multipart/form-data; boundary=" + boundary)
+        if key:
+            req.add_header("Authorization", "Bearer " + key)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8", "replace"))
+
+    def test_edit_multipart_reaches_account_selection_without_hanging(self):
+        """multipart /v1/images/edits 应被正确解析并走到选号，而不是卡死超时。"""
+        png = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+               b"\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\nIDATx\x9cc`\x00\x00"
+               b"\x00\x02\x00\x01\xe2!\xbc3\x00\x00\x00\x00IEND\xaeB`\x82")
+        status, body = self._multipart_request(
+            "/v1/images/edits",
+            "----wb-http-mp-1",
+            [
+                ({"Content-Disposition": 'form-data; name="model"'}, b"hunyuan-image-alpha-edit"),
+                ({"Content-Disposition": 'form-data; name="prompt"'}, "手办".encode("utf-8")),
+                ({"Content-Disposition": 'form-data; name="image"; filename="ref.png"',
+                  "Content-Type": "image/png"}, png),
+            ],
+            timeout=5,
+        )
+        self.assertGreaterEqual(status, 500)
+        text = json.dumps(body, ensure_ascii=False)
+        self.assertTrue("账号" in text or "account" in text.lower(), text)
+
+    def test_edit_multipart_missing_image_returns_400_fast(self):
+        status, body = self._multipart_request(
+            "/v1/images/edits",
+            "----wb-http-mp-2",
+            [
+                ({"Content-Disposition": 'form-data; name="model"'}, b"hunyuan-image-alpha-edit"),
+                ({"Content-Disposition": 'form-data; name="prompt"'}, b"edit"),
+            ],
+            timeout=5,
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("image", json.dumps(body, ensure_ascii=False))
+
+    def test_binary_multipart_to_json_route_returns_400_fast_without_hanging(self):
+        """向仅收 JSON 的路由发送含二进制字节的 multipart 时必须立刻回 400，不能挂起。"""
+        png = b"\x89PNG\r\n\x1a\n\x80\xff\xfe\x00"
+        status, body = self._multipart_request(
+            "/v1/images/generations",
+            "----wb-http-mp-3",
+            [
+                ({"Content-Disposition": 'form-data; name="prompt"'}, b"cat"),
+                ({"Content-Disposition": 'form-data; name="image"; filename="a.png"',
+                  "Content-Type": "image/png"}, png),
+            ],
+            timeout=5,
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("invalid JSON body", json.dumps(body, ensure_ascii=False))
+
     def test_video_missing_prompt(self):
         status, body, _ = _ON.json("POST", "/v1/videos", {"seconds": 5})
         self.assertEqual(status, 400)

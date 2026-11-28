@@ -42,14 +42,15 @@ TURN_FAIL = {"ok": False, "error": "会话在 120s 内没有跑完（状态=work
              "conversation": "c1", "retryable": True, "phase": "turn"}
 
 
-def make_account(name, rounds=None, models=None):
+def make_account(name, rounds=3, models=None):
     """轮数现在由候选序列决定：给几个候选就是几轮（至少两轮）。"""
     directory = os.path.join(ACCOUNTS, name)
     os.makedirs(directory, exist_ok=True)
-    if models is None and rounds:
+    # Retry timing must not depend on how many models are free in the current
+    # catalogue. Each test provides responses for this fixed candidate list.
+    if models is None:
         models = ["cand-%d" % i for i in range(rounds)]
-    if models is not None:
-        wb_settings.set_daily_chat_models(directory, models)
+    wb_settings.set_daily_chat_models(directory, models)
     return wb_accounts.Account(
         {"uid": "u1", "realm": "intl", "accessToken": "t"},
         path=os.path.join(directory, "acc.json"))

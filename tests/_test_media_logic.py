@@ -1072,5 +1072,86 @@ class ReferencePriceTierTests(unittest.TestCase):
         self.assertNotIn("minimax-video-h3|768P", payload)
 
 
+class MultipartEditParsingTests(unittest.TestCase):
+    """multipart/form-data 解析：/v1/images/edits 兼容 OpenAI 表单上传。"""
+
+    def _build_multipart(self, boundary, parts):
+        chunks = []
+        for headers, data in parts:
+            chunks.append(("--" + boundary + "\r\n").encode("ascii"))
+            for k, v in headers.items():
+                chunks.append(("%s: %s\r\n" % (k, v)).encode("utf-8"))
+            chunks.append(b"\r\n")
+            chunks.append(data)
+            chunks.append(b"\r\n")
+        chunks.append(("--" + boundary + "--\r\n").encode("ascii"))
+        return b"".join(chunks), 'multipart/form-data; boundary="%s"; charset=utf-8' % boundary
+
+    def test_parses_single_image_and_text_fields(self):
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        body, ct = self._build_multipart("----wb-test-1", [
+            ({"Content-Disposition": 'form-data; name="model"'}, b"hunyuan-image-alpha-edit"),
+            ({"Content-Disposition": 'form-data; name="prompt"'}, "手办化".encode("utf-8")),
+            ({"Content-Disposition": 'form-data; name="n"'}, b"1"),
+            ({"Content-Disposition": 'form-data; name="size"'}, b"1024x1024"),
+            ({"Content-Disposition": 'form-data; name="response_format"'}, b"b64_json"),
+            ({"Content-Disposition": 'form-data; name="image"; filename="ref.png"',
+              "Content-Type": "application/octet-stream"}, png_bytes),
+        ])
+        parsed = M.parse_edit_multipart(body, ct)
+        self.assertEqual(parsed["model"], "hunyuan-image-alpha-edit")
+        self.assertEqual(parsed["prompt"], "手办化")
+        self.assertEqual(parsed["n"], "1")
+        self.assertEqual(parsed["size"], "1024x1024")
+        self.assertEqual(parsed["response_format"], "b64_json")
+        self.assertEqual(len(parsed["image"]), 1)
+        self.assertTrue(parsed["image"][0].startswith("data:image/png;base64,"))
+
+    def test_parses_multiple_image_array_parts_and_ignores_binary_mask(self):
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x01" * 8
+        jpg_bytes = b"\xff\xd8\xff\xe0" + b"\x02" * 8
+        body, ct = self._build_multipart("----wb-test-2", [
+            ({"Content-Disposition": 'form-data; name="prompt"'}, b"combine"),
+            ({"Content-Disposition": 'form-data; name="image[]"; filename="a.png"',
+              "Content-Type": "image/png"}, png_bytes),
+            ({"Content-Disposition": 'form-data; name="image[]"; filename="b.jpg"',
+              "Content-Type": "image/jpg"}, jpg_bytes),
+            ({"Content-Disposition": 'form-data; name="mask"; filename="mask.png"',
+              "Content-Type": "image/png"}, png_bytes),
+        ])
+        parsed = M.parse_edit_multipart(body, ct)
+        self.assertEqual(len(parsed["image"]), 2)
+        self.assertTrue(parsed["image"][0].startswith("data:image/png;base64,"))
+        self.assertTrue(parsed["image"][1].startswith("data:image/jpeg;base64,"))
+        self.assertNotIn("mask", parsed)
+
+    def test_preserves_plain_url_image_field_for_ssrf_check(self):
+        body, ct = self._build_multipart("----wb-test-3", [
+            ({"Content-Disposition": 'form-data; name="prompt"'}, b"edit"),
+            ({"Content-Disposition": 'form-data; name="image"'}, b"http://127.0.0.1/secret.png"),
+        ])
+        parsed = M.parse_edit_multipart(body, ct)
+        self.assertEqual(parsed["image"], ["http://127.0.0.1/secret.png"])
+
+    def test_rejects_missing_boundary_empty_image_and_oversized_image(self):
+        self.assertEqual(error_code_of(M.parse_edit_multipart, b"", "multipart/form-data"),
+                         "INVALID_ARGS")
+        body_empty, ct_empty = self._build_multipart("----wb-empty", [
+            ({"Content-Disposition": 'form-data; name="prompt"'}, b"edit"),
+            ({"Content-Disposition": 'form-data; name="image"; filename="empty.png"',
+              "Content-Type": "image/png"}, b""),
+        ])
+        self.assertEqual(error_code_of(M.parse_edit_multipart, body_empty, ct_empty),
+                         "INVALID_ARGS")
+        big = b"\x89PNG\r\n\x1a\n" + b"a" * M.MAX_INPUT_IMAGE_BYTES
+        body_big, ct_big = self._build_multipart("----wb-big", [
+            ({"Content-Disposition": 'form-data; name="prompt"'}, b"edit"),
+            ({"Content-Disposition": 'form-data; name="image"; filename="big.png"',
+              "Content-Type": "image/png"}, big),
+        ])
+        self.assertEqual(error_code_of(M.parse_edit_multipart, body_big, ct_big),
+                         "INVALID_ARGS")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -400,10 +400,7 @@ def _no_redirect_opener():
     return opener
 
 
-_MIME_BY_EXTENSION = {
-    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
-}
+_MIME_BY_EXTENSION = wb_media._MIME_BY_EXTENSION
 
 
 def sniff_image_mime(data, fallback="image/png"):
@@ -412,18 +409,7 @@ def sniff_image_mime(data, fallback="image/png"):
     认不出来时兜底 png：宁可让上游按 png 试一次，也不要因为一个没见过的头
     拒掉用户给的图。
     """
-    if len(data) >= 4 and data[0] == 0x89 and data[1] == 0x50 \
-            and data[2] == 0x4E and data[3] == 0x47:
-        return "image/png"
-    if len(data) >= 3 and data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF:
-        return "image/jpeg"
-    if len(data) >= 4 and data[:4] == b"GIF8":
-        return "image/gif"
-    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "image/webp"
-    if len(data) >= 2 and data[:2] == b"BM":
-        return "image/bmp"
-    return fallback
+    return wb_media.sniff_image_mime(data, fallback=fallback)
 
 
 def _mime_for_url(url):

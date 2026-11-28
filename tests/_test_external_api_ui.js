@@ -1,4 +1,4 @@
-/* Static contract for the API 接入 dashboard page. */
+/* Static contract for the Access dashboard page. */
 
 'use strict';
 
@@ -15,38 +15,45 @@ catch (error) { throw new Error('dashboard inline script must parse: ' + error.m
 checks += 1;
 
 check(/id="btnNavApi"[^>]*onclick="switchMainTab\('api'\)"/.test(html),
-  '侧栏应提供独立的 API 接入入口');
+  '侧栏应提供独立的一级接入入口');
 const nextNav = html.slice(html.indexOf('<nav class="next-nav"'), html.indexOf('</nav>', html.indexOf('<nav class="next-nav"')));
 const nextNavTabs = [...nextNav.matchAll(/data-next-tab="([^"]+)"/g)].map(m => m[1]);
 check(JSON.stringify(nextNavTabs) === JSON.stringify([
-  'overview', 'accounts', 'gateway', 'analytics', 'tasks', 'media', 'agents', 'api', 'settings', 'logs'
+  'overview', 'accounts', 'api', 'gateway', 'analytics', 'tasks', 'media', 'agents', 'settings', 'logs'
 ]), '新导航应按核心运行/能力与任务/系统三组顺序排列');
 check(/data-next-tab="tasks"[\s\S]*?<span>自动化任务<\/span>/.test(nextNav),
   '侧栏任务页签应显示「自动化任务」');
-check(/data-next-tab="api"[\s\S]*?<span>接口<\/span>/.test(nextNav),
-  '新导航应使用两字菜单名「接口」');
+check(/data-next-tab="api"[\s\S]*?<span>接入<\/span>/.test(nextNav),
+  '新导航应使用两字菜单名「接入」');
 const moreSheet = html.slice(html.indexOf('<div id="nextMoreSheet"'), html.indexOf('<div class="modal-mask"', html.indexOf('<div id="nextMoreSheet"')));
 check(/data-next-tab="tasks"[\s\S]*?<span>自动化任务<\/span>/.test(moreSheet),
   '移动端更多菜单任务页签应显示「自动化任务」');
 check(/id="btnNavTasks"[^>]*>[\s\S]*?自动化任务/.test(html),
   '兼容导航任务按钮应显示「自动化任务」');
-check(/data-next-tab="api"[\s\S]*?<span>接口<\/span>/.test(moreSheet),
-  '移动端更多菜单应使用两字菜单名「接口」');
-check(nextNavTabs.indexOf('api') === 7, '新导航中接口应位于能力与任务组末尾');
-check(/id="btnNavApi"[^>]*>[\s\S]*?接口/.test(html),
-  '兼容导航应使用两字菜单名「接口」');
+check(/data-next-tab="api"[\s\S]*?<span>接入<\/span>/.test(moreSheet),
+  '移动端更多菜单应使用两字菜单名「接入」');
+check(nextNavTabs.indexOf('api') === 2, '新导航中接入应紧跟账号');
+check(/id="btnNavApi"[^>]*>[\s\S]*?接入/.test(html),
+  '兼容导航应使用两字菜单名「接入」');
 check(/id="pageApi" class="main-page/.test(html),
-  '应有独立的 API 接入页面容器');
-for(const [tab, pane] of [['apiKeyTab', 'apiPaneKeys'], ['apiRecordsTab', 'apiPaneRecords'], ['apiDocsTab', 'apiPaneDocs']]){
+  '应有独立的一级接入页面容器');
+for(const [tab, pane] of [['apiModelTab', 'apiPaneModels'], ['apiKeyTab', 'apiPaneKeys'], ['apiRecordsTab', 'apiPaneRecords'], ['apiDocsTab', 'apiPaneDocs']]){
   check(html.includes('id="' + tab + '" role="tab" aria-controls="' + pane + '"')
         && html.includes('id="' + pane + '" class="api-pane" role="tabpanel" aria-labelledby="' + tab + '"'),
-    'API 入口与内容面板应一一关联：' + tab);
+    '接入入口与内容面板应一一关联：' + tab);
 }
 
 const pageStart = html.indexOf('<div id="pageApi"');
 const pageEnd = html.indexOf('<div id="pageAgents"', pageStart);
 check(pageStart >= 0 && pageEnd > pageStart, 'API 接入页面范围可定位');
 const page = html.slice(pageStart, pageEnd);
+check(page.includes('id="keyList"') && page.includes('id="apiKeyExamples"') && page.includes('id="deletedKeySection"'),
+  '接入页应承载模型调用 Key 的列表、示例和已删除 Key');
+check(!html.slice(html.indexOf('<div id="pageSettings"'), pageStart).includes('id="keyList"'),
+  '设置页不应再保留模型调用 Key 列表');
+check(/data-count-cat="all"/.test(html) && /function refreshSettingsCategoryCounts\(\)/.test(script)
+      && /section\[data-cat\]/.test(script),
+  '设置分类计数应从实际区块动态统计，避免迁移后写死');
 check(page.includes('id="externalApiKeys"'), 'API Key 页应有 Key 列表容器');
 check(page.includes('id="externalApiRecords"'), 'API Key 页应有调用记录容器');
 check(!page.includes('API 功能') && !page.includes('调用流程'),
@@ -82,7 +89,7 @@ check(/method:\s*'GET'[\s\S]{0,220}query:\s*\{realm:\s*'intl'\}/.test(script),
 check(/curl[\s\S]{0,300}Authorization: Bearer/.test(script),
   '文档应动态提供带 Bearer 鉴权的完整 cURL 示例');
 check(/function\s+loadExternalApiPage\(\)/.test(script),
-  '切换 API 接入页时应有独立加载函数');
+  '切换接入页时应有独立加载函数');
 check(/EXTERNAL_API_RECORD_PAGE_SIZE\s*=\s*20/.test(script),
   '调用记录默认每页 20 条');
 check(/external\/call-records\?page=/.test(script) && /page_size=/.test(script),
@@ -93,10 +100,12 @@ check(/externalApiRecordRequestSeq/.test(script) &&
       /requestSeq\s*!==\s*externalApiRecordRequestSeq/.test(script),
   '调用记录应忽略乱序返回的旧分页响应');
 check(/\['api',\s*btnApi,\s*pageApi\]/.test(script),
-  '主页面切换数组应注册 API 接入页');
+  '主页面切换数组应注册接入页');
 
 for(const [zh, en] of [
-  ['API 接入', 'API access'],
+  ['接入', 'Access'],
+  ['模型调用 Key', 'Model access keys'],
+  ['外部账号接口 Key', 'External account API keys'],
   ['接口文档', 'API docs'],
   ['调用记录', 'Call records'],
   ['创建账号授权请求', 'Create an account authorization request'],
@@ -112,7 +121,6 @@ for(const [zh, en] of [
   ['调用方', 'Caller'],
   ['需要 account:auth', 'Requires account:auth'],
   ['需要 account:read', 'Requires account:read'],
-  ['管理外部 API Key、调用记录和账号接口文档。', 'Manage external API keys, call records, and account API documentation.'],
   ['cn / intl；决定本次授权使用的版本。', 'cn or intl; selects the account version for this authorization.'],
   ['创建授权请求时返回的请求标识。', 'Request identifier returned when the authorization request was created.'],
   ['cn / intl；筛选账号版本。', 'cn or intl; filters the account version.'],
@@ -120,6 +128,6 @@ for(const [zh, en] of [
 
 check(html.indexOf('id="btnNavAccounts"') < html.indexOf('id="btnNavApi"') &&
       html.indexOf('id="btnNavApi"') < html.indexOf('id="btnNavModels"'),
-  '兼容导航中接口应紧跟账号并位于模型入口之前');
+  '兼容导航中接入应紧跟账号并位于模型入口之前');
 
 console.log('OK ' + checks + ' checks');

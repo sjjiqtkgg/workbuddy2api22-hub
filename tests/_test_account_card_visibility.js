@@ -35,6 +35,8 @@ check(/\.id-btn-label\{color:var\(--dim\);font-size:11px;white-space:nowrap\}/.t
 // 桌面：列放宽 + 昵称允许换行。
 check(/table\.account-cards\{table-layout:fixed;width:100%;min-width:1096px\}/.test(html),
   '桌面账号表要跟随容器宽度，min-width 只作兜底');
+check(/@media \(min-width:1280px\)[\s\S]*?col\.acct-col-name\{width:22%\}/.test(html),
+  '账号列应参与宽屏剩余宽度比例分配，而不是固定 184px');
 check(/@media \(min-width:641px\)\{\s*\.acct-name\{flex:0 1 auto;max-width:100%;white-space:normal;overflow:visible;\s*text-overflow:clip;word-break:break-word\}/.test(html),
   '桌面昵称要能换行完整显示（基础规则里的 nowrap 会把它裁成省略号）');
 check(/\.acct-name\{flex:0 1 auto;max-width:100%;white-space:normal;overflow:visible;\s*text-overflow:clip;word-break:break-word\}/.test(html),
